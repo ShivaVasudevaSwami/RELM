@@ -89,65 +89,66 @@ if (isProduction) {
 // Initialize database, seed admin, then start server
 async function startServer() {
     await initDB();
-    seedAdmin();
+    await seedAdmin();
 
     app.listen(PORT, () => {
         console.log(`[Server] RE-LM API running on http://localhost:${PORT}`);
         console.log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`[Server] Database: ${process.env.SUPABASE_DB_URL ? 'Supabase PostgreSQL ☁️' : 'Local (no DB URL set)'}`);
     });
 
     // ─── BACKGROUND JOB: Reservation Expiry (every 60s) ─────
-    setInterval(() => {
+    setInterval(async () => {
         try {
             const now = new Date().toISOString();
 
             // 1. Expire stale Tier-2/3 reservations
-            const expired = queryAll(
+            const expired = await queryAll(
                 `SELECT r.*, p.property_name FROM reservations r
                  JOIN properties p ON r.property_id = p.id
-                 WHERE r.status = 'Active' AND r.expires_at <= ?`, [now]
+                 WHERE r.status = 'Active' AND r.expires_at <= $1`, [now]
             );
             for (const r of expired) {
-                runStmt(`UPDATE reservations SET status = 'Expired', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [r.id]);
+                await runStmt(`UPDATE reservations SET status = 'Expired', updated_at = NOW() WHERE id = $1`, [r.id]);
                 if (r.tier === 2) {
-                    runStmt(`UPDATE properties SET availability_status = 'Available', current_priority_lead_id = NULL WHERE id = ? AND availability_status = 'Reserved'`, [r.property_id]);
+                    await runStmt(`UPDATE properties SET availability_status = 'Available', current_priority_lead_id = NULL WHERE id = $1 AND availability_status = 'Reserved'`, [r.property_id]);
                 }
-                logAudit(runStmt, null, r.lead_id, 'reservation_expired', {
+                await logAudit(null, r.lead_id, 'reservation_expired', {
                     reservation_id: r.id, property_id: r.property_id, tier: r.tier,
                     property_name: r.property_name
                 });
-                recalculateAndSave(r.lead_id, queryOne, runStmt, null);
+                try { await recalculateAndSave(r.lead_id, null); } catch (e) { }
             }
 
             // 2. Handle ROFR deadline overrides
-            const rofrExpired = queryAll(
+            const rofrExpired = await queryAll(
                 `SELECT r.*, p.property_name FROM reservations r
                  JOIN properties p ON r.property_id = p.id
-                 WHERE r.status = 'Active' AND r.rofr_deadline IS NOT NULL AND r.rofr_deadline <= ?`, [now]
+                 WHERE r.status = 'Active' AND r.rofr_deadline IS NOT NULL AND r.rofr_deadline <= $1`, [now]
             );
             for (const r of rofrExpired) {
-                runStmt(`UPDATE reservations SET status = 'Overridden', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [r.id]);
-                runStmt(`UPDATE properties SET availability_status = 'Available', current_priority_lead_id = NULL WHERE id = ?`, [r.property_id]);
-                logAudit(runStmt, null, r.lead_id, 'rofr_deadline_expired', {
+                await runStmt(`UPDATE reservations SET status = 'Overridden', updated_at = NOW() WHERE id = $1`, [r.id]);
+                await runStmt(`UPDATE properties SET availability_status = 'Available', current_priority_lead_id = NULL WHERE id = $1`, [r.property_id]);
+                await logAudit(null, r.lead_id, 'rofr_deadline_expired', {
                     reservation_id: r.id, property_id: r.property_id,
                     challenger_lead_id: r.rofr_challenge_by,
                     message: 'ROFR deadline expired — reservation overridden'
                 });
-                recalculateAndSave(r.lead_id, queryOne, runStmt, null);
+                try { await recalculateAndSave(r.lead_id, null); } catch (e) { }
             }
 
             if (expired.length > 0 || rofrExpired.length > 0) {
                 console.log(`[BG] Expired ${expired.length} reservations, overrode ${rofrExpired.length} ROFR deadlines`);
             }
 
-            // 3. v4.2: Decision Deadline Miss — recalculate leads whose deadline just passed
-            const missedDeadlines = queryAll(
+            // 3. v4.2: Decision Deadline Miss
+            const missedDeadlines = await queryAll(
                 `SELECT id FROM leads WHERE decision_deadline IS NOT NULL
-                 AND decision_deadline <= ? AND status NOT IN ('Booking Confirmed', 'Not Interested')`,
+                 AND decision_deadline <= $1 AND status NOT IN ('Booking Confirmed', 'Not Interested')`,
                 [now]
             );
             for (const lead of missedDeadlines) {
-                recalculateAndSave(lead.id, queryOne, runStmt, null);
+                try { await recalculateAndSave(lead.id, null); } catch (e) { }
             }
         } catch (err) {
             console.error('[BG] Background job error:', err.message);

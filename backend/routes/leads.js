@@ -12,28 +12,26 @@ router.use(isAuthenticated);
 
 // ─────────────────────────────────────────────────────────────
 // Weighted Round-Robin: pick user with fewest active leads
-// under their capacity_limit, tiebreak by performance_rating
 // ─────────────────────────────────────────────────────────────
-function roundRobinAssign(role) {
-    const users = queryAll(
-        `SELECT u.id, u.username, u.capacity_limit, u.performance_rating,
+async function roundRobinAssign(role) {
+    const candidates = await queryAll(
+        `SELECT u.id, u.username, u.capacity_limit,
                 COUNT(l.id) as active_leads
          FROM users u
          LEFT JOIN leads l ON (
-            (? = 'telecaller' AND l.assigned_telecaller = u.id)
-            OR (? = 'agent' AND l.assigned_agent = u.id)
-         ) AND l.status NOT IN ('Not Interested', 'Booking Confirmed')
-         WHERE u.role = ? AND u.is_active = 1
-         GROUP BY u.id
-         HAVING active_leads < COALESCE(u.capacity_limit, 20)
-         ORDER BY active_leads ASC, u.last_assigned_at ASC, u.performance_rating DESC
+           (u.role = 'telecaller' AND l.assigned_telecaller = u.id)
+           OR (u.role = 'agent' AND l.assigned_agent = u.id)
+         ) AND l.status NOT IN ('Booking Confirmed', 'Not Interested')
+         WHERE u.role = $1 AND u.is_active = 1
+         GROUP BY u.id, u.username, u.capacity_limit
+         HAVING COUNT(l.id) < COALESCE(u.capacity_limit, 20)
+         ORDER BY COUNT(l.id) ASC, u.last_assigned_at ASC NULLS FIRST
          LIMIT 1`,
-        [role, role, role]
+        [role]
     );
-    if (users.length > 0) {
-        // Stamp last_assigned_at
-        runStmt('UPDATE users SET last_assigned_at = CURRENT_TIMESTAMP WHERE id = ?', [users[0].id]);
-        return users[0];
+    if (candidates.length > 0) {
+        await runStmt('UPDATE users SET last_assigned_at = NOW() WHERE id = $1', [candidates[0].id]);
+        return candidates[0];
     }
     return null;
 }
@@ -45,22 +43,21 @@ const PIPELINE_ORDER = [
 
 // GET /api/leads/check-phone — Check if phone exists
 router.get('/check-phone',
-    query('phone').matches(/^[6-9]\d{9}$/).withMessage('Invalid phone'),
-    (req, res) => {
-        const errors = validationResult(req);
-        if (!errors.isEmpty()) return res.status(400).json({ exists: false, error: 'Invalid phone' });
+    async (req, res) => {
+        const { phone } = req.query;
+        if (!phone) return res.status(400).json({ error: 'phone param required' });
 
-        const phone = req.query.phone;
-        const lead = queryOne('SELECT * FROM leads WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+        const lead = await queryOne(
+            'SELECT id, name, status, ml_status, created_at FROM leads WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
+            [phone]
+        );
         if (!lead) return res.json({ exists: false });
 
-        const countRow = queryOne('SELECT COUNT(*) as total FROM leads WHERE phone = ?', [phone]);
-        const total = countRow ? countRow.total : 0;
-
+        const totalRow = await queryOne('SELECT COUNT(*) as cnt FROM leads WHERE phone = $1', [phone]);
+        const total = totalRow ? parseInt(totalRow.cnt) : 0;
         return res.json({
             exists: true,
             status: lead.status,
-            ml_status: lead.ml_status,
             name: lead.name,
             created_at: lead.created_at,
             id: lead.id,
@@ -70,29 +67,14 @@ router.get('/check-phone',
     }
 );
 
-// IST offset helper: converts a JS Date to an IST-adjusted Date
-// On Render (UTC), new Date() gives UTC. We need IST (+5:30)
-const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000; // 5h 30m in ms
-function toIST(date) {
-    return new Date(date.getTime() + IST_OFFSET_MS);
-}
-function todayIST() {
-    const ist = toIST(new Date());
-    return ist.toISOString().split('T')[0]; // 'YYYY-MM-DD' in IST
-}
-
-// SQLite IST modifier: use instead of 'localtime' so it works on UTC servers
-const IST_MOD = "'+5 hours', '+30 minutes'";
-
 // Helper: fill in periods with zero counts so graph is continuous
 function fillMissingPeriods(rows, granularity, startDate, endDate) {
     if (!rows || rows.length === 0) return [];
     const rowMap = {};
     rows.forEach(r => { rowMap[r.period] = r; });
     const result = [];
-    // Use IST-aware dates for period generation
-    const current = startDate ? toIST(new Date(startDate)) : new Date(rows[0].period + (granularity === 'month' ? '-01' : granularity === 'day' ? '' : '-01-01'));
-    const end = toIST(new Date(endDate));
+    const current = startDate ? new Date(startDate) : new Date(rows[0].period + (granularity === 'month' ? '-01' : granularity === 'day' ? '' : '-01-01'));
+    const end = new Date(endDate);
     let safetyCounter = 0;
     while (current <= end && safetyCounter < 5000) {
         safetyCounter++;
@@ -115,36 +97,39 @@ function fillMissingPeriods(rows, granularity, startDate, endDate) {
 }
 
 // GET /api/leads/timeline — lead counts grouped by day/month/year/hour
-router.get('/timeline', (req, res) => {
+// PostgreSQL uses AT TIME ZONE 'Asia/Kolkata' for IST conversion
+router.get('/timeline', async (req, res) => {
     try {
         const { granularity = 'month', range = '1y' } = req.query;
         const user = req.session.user;
 
-        // Role filter params
         const roleParams = [];
         let roleFilter = '';
+        let paramIdx = 1;
+
         if (user.role !== 'admin' && user.role !== 'manager') {
-            roleFilter = 'AND created_by = ?';
+            roleFilter = `AND created_by = $${paramIdx}`;
             roleParams.push(user.id);
+            paramIdx++;
         }
 
         // Special case: day_hour (1D – hourly grouping)
         if (granularity === 'day_hour') {
-            // Compute "today" in IST (works on both local dev and Render UTC)
-            const todayStr = todayIST();
+            // Get today's date in IST
+            const todayResult = await queryOne("SELECT to_char(NOW() AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') as today");
+            const todayStr = todayResult.today;
 
-            // Use explicit IST offset in SQL instead of 'localtime'
-            const sql = `SELECT strftime('%H', created_at, ${IST_MOD}) as hour,
+            const sql = `SELECT to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'HH24') as hour,
                 COUNT(*) as total,
                 SUM(CASE WHEN ml_status = 'Hot' THEN 1 ELSE 0 END) as hot,
                 SUM(CASE WHEN ml_status = 'Warm' THEN 1 ELSE 0 END) as warm,
                 SUM(CASE WHEN ml_status = 'Cold' THEN 1 ELSE 0 END) as cold,
                 SUM(CASE WHEN status = 'Booking Confirmed' THEN 1 ELSE 0 END) as confirmed
-                FROM leads WHERE date(created_at, ${IST_MOD}) = ? ${roleFilter}
+                FROM leads
+                WHERE to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') = $${paramIdx} ${roleFilter}
                 GROUP BY hour ORDER BY hour ASC`;
-            const rows = queryAll(sql, [todayStr, ...roleParams]);
+            const rows = await queryAll(sql, [...roleParams, todayStr]);
 
-            // Build 24-hour skeleton with matching padded keys
             const rowMap = {};
             rows.forEach(r => { rowMap[r.hour] = r; });
             const filled = [];
@@ -154,11 +139,11 @@ router.get('/timeline', (req, res) => {
                 const row = rowMap[hourKey];
                 filled.push({
                     period,
-                    total: row?.total || 0,
-                    hot: row?.hot || 0,
-                    warm: row?.warm || 0,
-                    cold: row?.cold || 0,
-                    confirmed: row?.confirmed || 0
+                    total: parseInt(row?.total) || 0,
+                    hot: parseInt(row?.hot) || 0,
+                    warm: parseInt(row?.warm) || 0,
+                    cold: parseInt(row?.cold) || 0,
+                    confirmed: parseInt(row?.confirmed) || 0
                 });
             }
             return res.json({ granularity: 'day_hour', range, data: filled });
@@ -176,9 +161,9 @@ router.get('/timeline', (req, res) => {
 
         let dateFormat;
         switch (granularity) {
-            case 'day': dateFormat = `strftime('%Y-%m-%d', created_at, ${IST_MOD})`; break;
-            case 'year': dateFormat = `strftime('%Y', created_at, ${IST_MOD})`; break;
-            default: dateFormat = `strftime('%Y-%m', created_at, ${IST_MOD})`; break;
+            case 'day': dateFormat = "to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD')"; break;
+            case 'year': dateFormat = "to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY')"; break;
+            default: dateFormat = "to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM')"; break;
         }
 
         let sql = `SELECT ${dateFormat} as period,
@@ -191,16 +176,25 @@ router.get('/timeline', (req, res) => {
         const params = [...roleParams];
 
         if (user.role !== 'admin' && user.role !== 'manager') {
-            sql += ' AND created_by = ?';
+            sql += ` AND created_by = $${params.indexOf(user.id) + 1}`;
         }
         if (startDate) {
-            sql += ' AND created_at >= ?';
             params.push(startDate.toISOString());
+            sql += ` AND created_at >= $${params.length}`;
         }
         sql += ' GROUP BY period ORDER BY period ASC';
 
-        const rows = queryAll(sql, params);
-        const filledRows = fillMissingPeriods(rows, granularity, startDate, now);
+        const rows = await queryAll(sql, params);
+        // Convert bigint counts to numbers
+        const normalized = rows.map(r => ({
+            ...r,
+            total: parseInt(r.total) || 0,
+            hot: parseInt(r.hot) || 0,
+            warm: parseInt(r.warm) || 0,
+            cold: parseInt(r.cold) || 0,
+            confirmed: parseInt(r.confirmed) || 0
+        }));
+        const filledRows = fillMissingPeriods(normalized, granularity, startDate, now);
 
         return res.json({ granularity, range, data: filledRows });
     } catch (err) {
@@ -210,7 +204,7 @@ router.get('/timeline', (req, res) => {
 });
 
 // GET /api/leads/by-period — leads for a specific period
-router.get('/by-period', (req, res) => {
+router.get('/by-period', async (req, res) => {
     try {
         const { period, granularity = 'month', ml_status } = req.query;
         const user = req.session.user;
@@ -218,34 +212,42 @@ router.get('/by-period', (req, res) => {
 
         let dateFilter;
         const params = [];
+        let paramIdx = 1;
+
         switch (granularity) {
             case 'day_hour': {
                 const [datePart, hourPart] = period.split('T');
-                dateFilter = `date(l.created_at, ${IST_MOD}) = ? AND strftime('%H', l.created_at, ${IST_MOD}) = ?`;
+                dateFilter = `to_char(l.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') = $${paramIdx} AND to_char(l.created_at AT TIME ZONE 'Asia/Kolkata', 'HH24') = $${paramIdx + 1}`;
                 params.push(datePart, String(hourPart || '00').padStart(2, '0'));
+                paramIdx += 2;
                 break;
             }
             case 'day':
-                dateFilter = `date(l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
+                dateFilter = `to_char(l.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') = $${paramIdx}`;
+                params.push(period); paramIdx++; break;
             case 'year':
-                dateFilter = `strftime('%Y', l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
+                dateFilter = `to_char(l.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY') = $${paramIdx}`;
+                params.push(period); paramIdx++; break;
             default:
-                dateFilter = `strftime('%Y-%m', l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
+                dateFilter = `to_char(l.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = $${paramIdx}`;
+                params.push(period); paramIdx++; break;
         }
 
         let roleFilter = '';
         if (user.role !== 'admin' && user.role !== 'manager') {
-            roleFilter = 'AND l.created_by = ?';
+            roleFilter = `AND l.created_by = $${paramIdx}`;
             params.push(user.id);
+            paramIdx++;
         }
 
         let mlFilter = '';
         if (ml_status && ['Hot', 'Warm', 'Cold'].includes(ml_status)) {
-            mlFilter = 'AND l.ml_status = ?';
+            mlFilter = `AND l.ml_status = $${paramIdx}`;
             params.push(ml_status);
+            paramIdx++;
         }
 
-        const leads = queryAll(
+        const leads = await queryAll(
             `SELECT l.*, u.username as agent_name, p.property_name as matched_property_name
              FROM leads l LEFT JOIN users u ON l.created_by = u.id
              LEFT JOIN properties p ON l.matched_property_id = p.id
@@ -261,7 +263,7 @@ router.get('/by-period', (req, res) => {
 });
 
 // GET /api/leads — supports ?ml_status=Hot|Warm|Cold AND ?stage=pipeline_stage
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
     const { status, ml_status, stage } = req.query;
     const user = req.session.user;
     const ML_VALUES = ['Hot', 'Warm', 'Cold'];
@@ -273,33 +275,35 @@ router.get('/', (req, res) => {
       LEFT JOIN properties ON leads.matched_property_id = properties.id
       WHERE 1=1`;
     const params = [];
+    let paramIdx = 1;
 
-    // Role-based filtering — 4-role RBAC
     if (user.role === 'telecaller') {
-        sql += ' AND (leads.assigned_telecaller = ? OR leads.created_by = ?)';
+        sql += ` AND (leads.assigned_telecaller = $${paramIdx} OR leads.created_by = $${paramIdx + 1})`;
         params.push(user.id, user.id);
+        paramIdx += 2;
     } else if (user.role === 'agent') {
-        sql += ' AND leads.assigned_agent = ?';
+        sql += ` AND leads.assigned_agent = $${paramIdx}`;
         params.push(user.id);
+        paramIdx++;
     }
-    // manager & admin: no filter — full visibility
 
-    // ML status filter — ?ml_status=Hot or backward-compat ?status=Hot
     const mlFilter = ml_status || (status && ML_VALUES.includes(status) ? status : null);
     if (mlFilter && ML_VALUES.includes(mlFilter)) {
-        sql += ' AND leads.ml_status = ?';
+        sql += ` AND leads.ml_status = $${paramIdx}`;
         params.push(mlFilter);
+        paramIdx++;
     }
 
-    // Pipeline stage filter — ?stage=Contacted or ?status=Contacted (if not an ML value)
     const stageFilter = stage || (status && PIPELINE_STAGES.includes(status) && !ML_VALUES.includes(status) ? status : null);
     if (stageFilter && PIPELINE_STAGES.includes(stageFilter)) {
-        sql += ' AND leads.status = ?';
+        sql += ` AND leads.status = $${paramIdx}`;
         params.push(stageFilter);
+        paramIdx++;
     }
 
     sql += ' ORDER BY leads.created_at DESC';
-    return res.json(queryAll(sql, params));
+    const leads = await queryAll(sql, params);
+    return res.json(leads);
 });
 
 // POST /api/leads — Create (with duplicate phone check + inquiry counter)
@@ -310,7 +314,7 @@ router.post('/',
     body('email').optional({ values: 'falsy' }).isEmail().withMessage('Enter a valid email address'),
     body('preferred_property_type').optional(),
     body('budget_range').optional(),
-    (req, res) => {
+    async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({
@@ -325,7 +329,7 @@ router.post('/',
             assigned_telecaller, assigned_agent, next_follow_up } = req.body;
 
         // Duplicate phone check
-        const existingLead = queryOne('SELECT * FROM leads WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+        const existingLead = await queryOne('SELECT * FROM leads WHERE phone = $1 ORDER BY created_at DESC LIMIT 1', [phone]);
         if (existingLead && existingLead.status !== 'Not Interested' && existingLead.status !== 'Booking Confirmed') {
             return res.status(409).json({
                 error: 'duplicate',
@@ -338,35 +342,31 @@ router.post('/',
             });
         }
 
-        // Count previous leads with same phone
-        const countRow = queryOne('SELECT COUNT(*) as cnt FROM leads WHERE phone = ?', [phone]);
-        const prevCount = countRow ? countRow.cnt : 0;
+        const countRow = await queryOne('SELECT COUNT(*) as cnt FROM leads WHERE phone = $1', [phone]);
+        const prevCount = countRow ? parseInt(countRow.cnt) : 0;
         const inquiryCount = prevCount + 1;
 
-        // Serialize extra_details as JSON string for storage
         const extraDetailsJson = extra_details ? JSON.stringify(extra_details) : null;
 
-        // Auto-assign telecaller via Weighted Round-Robin
         const user = req.session.user;
         let telecallerId = assigned_telecaller || (user.role === 'telecaller' ? user.id : null);
         let agentId = assigned_agent || null;
 
-        // VIP Auto-Assignment: returning VIPs bypass TC pool → previous agent
+        // VIP Auto-Assignment
         if (existingLead && existingLead.is_vip && existingLead.assigned_agent) {
             agentId = existingLead.assigned_agent;
-            logAudit(runStmt, user.id, null, 'vip_auto_assign', {
+            await logAudit(user.id, null, 'vip_auto_assign', {
                 message: `VIP returning — auto-assigned to previous agent (ID: ${agentId})`,
                 original_lead_id: existingLead.id
             });
         }
 
-        // If no telecaller assigned, use round-robin
         if (!telecallerId) {
-            const assignedTc = roundRobinAssign('telecaller');
+            const assignedTc = await roundRobinAssign('telecaller');
             if (assignedTc) telecallerId = assignedTc.id;
         }
 
-        const result = runStmt(
+        const result = await runStmt(
             `INSERT INTO leads (name, phone, email, preferred_property_type,
        preferred_state, preferred_city, preferred_area, budget_range,
        funding_source, urgency, occupation, purchase_purpose,
@@ -374,7 +374,7 @@ router.post('/',
        status, ml_status, matched_property_id,
        inquiry_count, linked_phone, created_by,
        assigned_telecaller, assigned_agent, next_follow_up)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New Inquiry', 'Cold', ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'New Inquiry', 'Cold', $15, $16, $17, $18, $19, $20, $21)`,
             [name, phone, email || null, preferred_property_type || null,
                 preferred_state || null, preferred_city || null, preferred_area || null,
                 budget_range || null, funding_source || null, urgency || null,
@@ -389,12 +389,12 @@ router.post('/',
 
         // Insert lead_history record from PREVIOUS lead if exists
         if (existingLead && (existingLead.status === 'Not Interested' || existingLead.status === 'Booking Confirmed')) {
-            const creatorUser = queryOne('SELECT username FROM users WHERE id = ?', [existingLead.created_by]);
-            runStmt(
+            const creatorUser = await queryOne('SELECT username FROM users WHERE id = $1', [existingLead.created_by]);
+            await runStmt(
                 `INSERT INTO lead_history
          (phone, lead_id, source_lead_id, lead_name, property_type, budget_range,
            final_stage, added_by_username, added_date, closure_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
                 [phone, newLeadId, existingLead.id, existingLead.name,
                     existingLead.preferred_property_type, existingLead.budget_range,
                     existingLead.status, creatorUser ? creatorUser.username : 'Unknown',
@@ -403,16 +403,18 @@ router.post('/',
         }
 
         // Calculate initial lead score
-        const scoreResult = recalculateAndSave(newLeadId, queryOne, runStmt, req.session.user.id);
+        let scoreResult = null;
+        try {
+            scoreResult = await recalculateAndSave(newLeadId, req.session.user.id);
+        } catch (e) { console.warn('[Scoring] Error on new lead:', e.message); }
 
-        // v4.2 Zombie Resurrection: if re-inquiry >180 days, notify about zombie
+        // v4.2 Zombie Resurrection
         let isZombie = false;
         if (existingLead && (existingLead.status === 'Not Interested' || existingLead.status === 'Booking Confirmed')) {
             const daysSinceClosed = (Date.now() - new Date(existingLead.created_at).getTime()) / 86400000;
             isZombie = daysSinceClosed >= 180;
             if (!isZombie && existingLead.assigned_agent) {
-                // <180 days: notify original agent via audit log
-                logAudit(runStmt, req.session.user.id, newLeadId, 'zombie_short_return', {
+                await logAudit(req.session.user.id, newLeadId, 'zombie_short_return', {
                     message: `Lead re-inquired within 180 days. Original agent (ID: ${existingLead.assigned_agent}) should be notified.`,
                     original_lead_id: existingLead.id,
                     days_since_close: Math.round(daysSinceClosed)
@@ -420,11 +422,10 @@ router.post('/',
             }
         }
 
-        // Audit log for lead creation
-        logAudit(runStmt, req.session.user.id, newLeadId, 'lead_created',
+        await logAudit(req.session.user.id, newLeadId, 'lead_created',
             { name, phone, assigned_telecaller: telecallerId, assigned_agent: assigned_agent || null });
 
-        const newLead = queryOne('SELECT * FROM leads WHERE id = ?', [newLeadId]);
+        const newLead = await queryOne('SELECT * FROM leads WHERE id = $1', [newLeadId]);
         return res.status(201).json({
             lead: newLead,
             score: scoreResult ? scoreResult.score : null,
@@ -434,51 +435,47 @@ router.post('/',
 );
 
 // GET /api/leads/:id
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
     const user = req.session.user;
     const leadId = parseInt(req.params.id);
 
-    const lead = queryOne(`SELECT leads.*, users.username as agent_name
-    FROM leads LEFT JOIN users ON leads.created_by = users.id WHERE leads.id = ?`, [leadId]);
+    const lead = await queryOne(`SELECT leads.*, users.username as agent_name
+    FROM leads LEFT JOIN users ON leads.created_by = users.id WHERE leads.id = $1`, [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    // RBAC: telecaller sees only assigned/created leads, agent sees only assigned leads
     if (user.role === 'telecaller' && lead.assigned_telecaller !== user.id && lead.created_by !== user.id)
         return res.status(403).json({ error: 'Access denied' });
     if (user.role === 'agent' && lead.assigned_agent !== user.id)
         return res.status(403).json({ error: 'Access denied' });
 
-    const interactions = queryAll(
-        'SELECT * FROM interactions WHERE lead_id = ? ORDER BY interaction_date DESC', [leadId]);
-    const site_visits = queryAll(
-        'SELECT * FROM site_visits WHERE lead_id = ? ORDER BY logged_at DESC', [leadId]);
+    const interactions = await queryAll(
+        'SELECT * FROM interactions WHERE lead_id = $1 ORDER BY interaction_date DESC', [leadId]);
+    const site_visits = await queryAll(
+        'SELECT * FROM site_visits WHERE lead_id = $1 ORDER BY logged_at DESC', [leadId]);
     let matched_property = null;
     if (lead.matched_property_id)
-        matched_property = queryOne('SELECT * FROM properties WHERE id = ?', [lead.matched_property_id]);
+        matched_property = await queryOne('SELECT * FROM properties WHERE id = $1', [lead.matched_property_id]);
 
-    // Multi-Booking Hub data
-    const negotiation_count = queryOne(
-        `SELECT COUNT(*) as cnt FROM negotiations WHERE lead_id = ? AND status = 'Active'`, [leadId]
-    );
-    const booking_count = queryOne(
-        `SELECT COUNT(*) as cnt FROM bookings WHERE lead_id = ?`, [leadId]
-    );
+    const negotiation_count = await queryOne(
+        `SELECT COUNT(*) as cnt FROM negotiations WHERE lead_id = $1 AND status = 'Active'`, [leadId]);
+    const booking_count = await queryOne(
+        `SELECT COUNT(*) as cnt FROM bookings WHERE lead_id = $1`, [leadId]);
 
     return res.json({
         lead, interactions, site_visits, matched_property,
-        active_negotiations: negotiation_count?.cnt || 0,
-        total_bookings: booking_count?.cnt || 0
+        active_negotiations: parseInt(negotiation_count?.cnt) || 0,
+        total_bookings: parseInt(booking_count?.cnt) || 0
     });
 });
 
 // GET /api/leads/:id/history — Lead history by phone
-router.get('/:id/history', (req, res) => {
+router.get('/:id/history', async (req, res) => {
     const leadId = parseInt(req.params.id);
-    const lead = queryOne('SELECT phone FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT phone FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    const history = queryAll(
-        'SELECT * FROM lead_history WHERE phone = ? ORDER BY added_date DESC',
+    const history = await queryAll(
+        'SELECT * FROM lead_history WHERE phone = $1 ORDER BY added_date DESC',
         [lead.phone]
     );
     return res.json({ history });
@@ -487,7 +484,7 @@ router.get('/:id/history', (req, res) => {
 // PUT /api/leads/:id/status
 router.put('/:id/status',
     body('status').notEmpty().withMessage('Status is required'),
-    (req, res) => {
+    async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
@@ -498,74 +495,66 @@ router.put('/:id/status',
         if (!PIPELINE_ORDER.includes(newStatus))
             return res.status(400).json({ error: `Invalid status. Must be one of: ${PIPELINE_ORDER.join(', ')}` });
 
-        const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+        const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
         if (!lead) return res.status(404).json({ error: 'Lead not found' });
         if (user.role === 'agent' && lead.created_by !== user.id)
             return res.status(403).json({ error: 'Access denied' });
 
-        // === REVERSE LOGIC: If moving AWAY from Booking Confirmed, restore property ===
+        // Reverse Logic
         if (lead.status === 'Booking Confirmed' && newStatus !== 'Booking Confirmed') {
             if (lead.matched_property_id) {
-                runStmt('UPDATE properties SET is_available = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                await runStmt('UPDATE properties SET is_available = 1, updated_at = NOW() WHERE id = $1',
                     [lead.matched_property_id]);
             }
         }
 
-        // Booking Confirmed: force ml_status to Gold/Hot + auto-mark property sold + set VIP
+        // Booking Confirmed
         if (newStatus === 'Booking Confirmed') {
-            // Set VIP status & accumulate lifetime value
             const propertyPrice = lead.matched_property_id
-                ? (queryOne('SELECT price_inr FROM properties WHERE id = ?', [lead.matched_property_id])?.price_inr || 0)
+                ? ((await queryOne('SELECT price_inr FROM properties WHERE id = $1', [lead.matched_property_id]))?.price_inr || 0)
                 : 0;
-            runStmt(
-                `UPDATE leads SET status = ?, ml_status = 'Gold', is_vip = 1,
-                 lifetime_value = COALESCE(lifetime_value, 0) + ? WHERE id = ?`,
+            await runStmt(
+                `UPDATE leads SET status = $1, ml_status = 'Gold', is_vip = 1,
+                 lifetime_value = COALESCE(lifetime_value, 0) + $2 WHERE id = $3`,
                 ['Booking Confirmed', propertyPrice, leadId]
             );
 
-            // Auto-mark matched property as sold
             let soldProperty = null;
             if (lead.matched_property_id) {
-                runStmt(`UPDATE properties SET is_available = 0, availability_status = 'Sold',
-                    updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [lead.matched_property_id]);
-                soldProperty = queryOne('SELECT * FROM properties WHERE id = ?', [lead.matched_property_id]);
+                await runStmt(`UPDATE properties SET is_available = 0, availability_status = 'Sold',
+                    updated_at = NOW() WHERE id = $1`, [lead.matched_property_id]);
+                soldProperty = await queryOne('SELECT * FROM properties WHERE id = $1', [lead.matched_property_id]);
             }
 
-            logAudit(runStmt, user.id, leadId, 'vip_status_granted', {
+            await logAudit(user.id, leadId, 'vip_status_granted', {
                 message: 'Lead achieved Booking Confirmed — permanent VIP/Gold status',
                 lifetime_value: (lead.lifetime_value || 0) + propertyPrice
             });
 
-            const updated = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+            const updated = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
             return res.json({
-                lead: updated,
-                property_sold: !!soldProperty,
-                sold_property: soldProperty,
-                vip_granted: true
+                lead: updated, property_sold: !!soldProperty,
+                sold_property: soldProperty, vip_granted: true
             });
         }
 
-        // Not Interested: VIP Protection — VIPs never go Cold
+        // Not Interested: VIP protection
         if (newStatus === 'Not Interested') {
             if (lead.is_vip) {
-                // VIP: close the current inquiry session, keep Gold status
-                logAudit(runStmt, user.id, leadId, 'vip_inquiry_closed', {
+                await logAudit(user.id, leadId, 'vip_inquiry_closed', {
                     message: 'VIP rejected current inquiry but retains Gold status',
                     from: lead.status, attempted: 'Not Interested'
                 });
-                const updated = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+                const updated = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
                 return res.json({
-                    lead: updated,
-                    vip_protected: true,
+                    lead: updated, vip_protected: true,
                     message: 'VIP lead is protected. Inquiry session closed but Gold status preserved.'
                 });
             }
-            runStmt('UPDATE leads SET status = ?, ml_status = ? WHERE id = ?',
+            await runStmt('UPDATE leads SET status = $1, ml_status = $2 WHERE id = $3',
                 ['Not Interested', 'Cold', leadId]);
-            logAudit(runStmt, user.id, leadId, 'status_change',
-                { from: lead.status, to: 'Not Interested' });
-            const updated = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+            await logAudit(user.id, leadId, 'status_change', { from: lead.status, to: 'Not Interested' });
+            const updated = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
             return res.json({ lead: updated });
         }
 
@@ -579,9 +568,10 @@ router.put('/:id/status',
                 error: `Can only move one step forward. Current: '${lead.status}', next allowed: '${PIPELINE_ORDER[currentIdx + 1] || 'none'}'`
             });
 
-        // ═══ QUALITY GATE (v4.2): TC cannot schedule visit without key fields ═══
+        // Quality Gate (v4.2)
         if (newStatus === 'Site Visit Scheduled') {
-            const extra = lead.extra_details ? JSON.parse(lead.extra_details) : {};
+            let extra = {};
+            try { extra = typeof lead.extra_details === 'string' ? JSON.parse(lead.extra_details) : (lead.extra_details || {}); } catch (e) { extra = {}; }
             const missing = [];
             if (!lead.occupation) missing.push('Occupation');
             if (!lead.budget_range) missing.push('Budget Range');
@@ -593,78 +583,72 @@ router.put('/:id/status',
                 });
             }
 
-            // ═══ BATON PASS (v4.2): TC must assign an Agent ═══
+            // Baton Pass (v4.2)
             const { assigned_agent: batonAgent } = req.body;
             if (!batonAgent && !lead.assigned_agent) {
-                return res.status(400).json({
-                    error: 'Baton Pass: You must select an assigned Agent before scheduling a site visit.'
-                });
+                return res.status(400).json({ error: 'Baton Pass: You must select an assigned Agent before scheduling a site visit.' });
             }
             if (batonAgent) {
-                runStmt('UPDATE leads SET assigned_agent = ? WHERE id = ?', [batonAgent, leadId]);
-                logAudit(runStmt, user.id, leadId, 'baton_pass', {
+                await runStmt('UPDATE leads SET assigned_agent = $1 WHERE id = $2', [batonAgent, leadId]);
+                await logAudit(user.id, leadId, 'baton_pass', {
                     from_telecaller: user.id, to_agent: batonAgent,
                     message: 'TC ownership ended — lead transferred to Agent'
                 });
             }
         }
 
-        // Save next_follow_up if provided
         if (next_follow_up) {
-            runStmt('UPDATE leads SET status = ?, next_follow_up = ? WHERE id = ?', [newStatus, next_follow_up, leadId]);
+            await runStmt('UPDATE leads SET status = $1, next_follow_up = $2 WHERE id = $3', [newStatus, next_follow_up, leadId]);
         } else {
-            runStmt('UPDATE leads SET status = ? WHERE id = ?', [newStatus, leadId]);
+            await runStmt('UPDATE leads SET status = $1 WHERE id = $2', [newStatus, leadId]);
         }
 
-        // Audit log
-        logAudit(runStmt, user.id, leadId, 'status_change',
+        await logAudit(user.id, leadId, 'status_change',
             { from: lead.status, to: newStatus, next_follow_up: next_follow_up || null });
 
-        const updated = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+        const updated = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
         return res.json({ lead: updated });
     }
 );
 
 // PUT /api/leads/:id/match-property
-router.put('/:id/match-property', (req, res) => {
+router.put('/:id/match-property', async (req, res) => {
     const leadId = parseInt(req.params.id);
     const { property_id } = req.body;
     const user = req.session.user;
 
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
     if (user.role === 'agent' && lead.created_by !== user.id)
         return res.status(403).json({ error: 'Access denied' });
 
-    // If lead is Booking Confirmed and had a DIFFERENT previous property, restore it
     if (lead.matched_property_id &&
         lead.matched_property_id !== (property_id ? parseInt(property_id) : null) &&
         lead.status === 'Booking Confirmed') {
-        runStmt('UPDATE properties SET is_available = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        await runStmt('UPDATE properties SET is_available = 1, updated_at = NOW() WHERE id = $1',
             [lead.matched_property_id]);
     }
 
     if (property_id === null || property_id === undefined || property_id === '') {
-        runStmt('UPDATE leads SET matched_property_id = NULL WHERE id = ?', [leadId]);
+        await runStmt('UPDATE leads SET matched_property_id = NULL WHERE id = $1', [leadId]);
     } else {
-        const property = queryOne('SELECT * FROM properties WHERE id = ?', [parseInt(property_id)]);
+        const property = await queryOne('SELECT * FROM properties WHERE id = $1', [parseInt(property_id)]);
         if (!property) return res.status(404).json({ error: 'Property not found' });
-        runStmt('UPDATE leads SET matched_property_id = ? WHERE id = ?', [parseInt(property_id), leadId]);
+        await runStmt('UPDATE leads SET matched_property_id = $1 WHERE id = $2', [parseInt(property_id), leadId]);
 
-        // If lead is already Booking Confirmed, immediately mark new property as sold
         if (lead.status === 'Booking Confirmed') {
-            runStmt('UPDATE properties SET is_available = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            await runStmt('UPDATE properties SET is_available = 0, updated_at = NOW() WHERE id = $1',
                 [parseInt(property_id)]);
         }
     }
 
-    // Recalculate score with new property match
-    const scoreResult = recalculateAndSave(leadId, queryOne, runStmt, req.session.user.id);
-    const updatedLead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    let scoreResult = null;
+    try { scoreResult = await recalculateAndSave(leadId, req.session.user.id); } catch (e) { }
+    const updatedLead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
 
     let soldProperty = null;
     if (lead.status === 'Booking Confirmed' && property_id) {
-        soldProperty = queryOne('SELECT * FROM properties WHERE id = ?', [parseInt(property_id)]);
+        soldProperty = await queryOne('SELECT * FROM properties WHERE id = $1', [parseInt(property_id)]);
     }
 
     return res.json({
@@ -677,45 +661,47 @@ router.put('/:id/match-property', (req, res) => {
 });
 
 // DELETE /api/leads/:id — Admin only
-router.delete('/:id', isAdmin, (req, res) => {
+router.delete('/:id', isAdmin, async (req, res) => {
     const leadId = parseInt(req.params.id);
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    // If lead was Booking Confirmed with a property, restore property availability
     if (lead.status === 'Booking Confirmed' && lead.matched_property_id) {
-        runStmt('UPDATE properties SET is_available = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        await runStmt('UPDATE properties SET is_available = 1, updated_at = NOW() WHERE id = $1',
             [lead.matched_property_id]);
     }
 
-    runStmt('DELETE FROM interactions WHERE lead_id = ?', [leadId]);
-    runStmt('DELETE FROM site_visits WHERE lead_id = ?', [leadId]);
-    runStmt('DELETE FROM leads WHERE id = ?', [leadId]);
+    await runStmt('DELETE FROM interactions WHERE lead_id = $1', [leadId]);
+    await runStmt('DELETE FROM site_visits WHERE lead_id = $1', [leadId]);
+    await runStmt('DELETE FROM leads WHERE id = $1', [leadId]);
     return res.json({ message: 'Lead deleted' });
 });
 
-// PUT /api/leads/:id/assign — Manager/Admin: reassign lead to telecaller or agent
-router.put('/:id/assign', isManagerOrAdmin, (req, res) => {
+// PUT /api/leads/:id/assign — Manager/Admin: reassign
+router.put('/:id/assign', isManagerOrAdmin, async (req, res) => {
     const leadId = parseInt(req.params.id);
     const { assigned_telecaller, assigned_agent } = req.body;
     const user = req.session.user;
 
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
     const updates = [];
     const params = [];
     const auditDetails = {};
+    let paramIdx = 1;
 
     if (assigned_telecaller !== undefined) {
-        updates.push('assigned_telecaller = ?');
+        updates.push(`assigned_telecaller = $${paramIdx}`);
         params.push(assigned_telecaller || null);
         auditDetails.assigned_telecaller = { from: lead.assigned_telecaller, to: assigned_telecaller || null };
+        paramIdx++;
     }
     if (assigned_agent !== undefined) {
-        updates.push('assigned_agent = ?');
+        updates.push(`assigned_agent = $${paramIdx}`);
         params.push(assigned_agent || null);
         auditDetails.assigned_agent = { from: lead.assigned_agent, to: assigned_agent || null };
+        paramIdx++;
     }
 
     if (updates.length === 0) {
@@ -723,55 +709,43 @@ router.put('/:id/assign', isManagerOrAdmin, (req, res) => {
     }
 
     params.push(leadId);
-    runStmt(`UPDATE leads SET ${updates.join(', ')} WHERE id = ?`, params);
+    await runStmt(`UPDATE leads SET ${updates.join(', ')} WHERE id = $${paramIdx}`, params);
+    await logAudit(user.id, leadId, 'assignment', auditDetails);
 
-    // Audit log
-    logAudit(runStmt, user.id, leadId, 'assignment', auditDetails);
-
-    const updatedLead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const updatedLead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     return res.json({ lead: updatedLead, message: 'Lead reassigned successfully' });
 });
 
-// ─────────────────────────────────────────────────────────────
-// PUT /api/leads/:id/flag-junk — Agent flags lead as Junk/Fake
-// ─────────────────────────────────────────────────────────────
-router.put('/:id/flag-junk', (req, res) => {
+// PUT /api/leads/:id/flag-junk
+router.put('/:id/flag-junk', async (req, res) => {
     const leadId = parseInt(req.params.id);
     const { reason } = req.body;
     const user = req.session.user;
 
-    // Only agents, managers, admins can flag junk
     if (user.role === 'telecaller') {
         return res.status(403).json({ error: 'Only Agents/Managers can flag leads as junk' });
     }
-
     if (!reason || reason.trim().length < 5) {
         return res.status(400).json({ error: 'A reason (min 5 chars) is required' });
     }
 
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    runStmt(
-        'UPDATE leads SET is_junk = 1, junk_reason = ?, ml_status = ? WHERE id = ?',
-        [reason, 'Cold', leadId]
-    );
+    await runStmt('UPDATE leads SET is_junk = 1, junk_reason = $1, ml_status = $2 WHERE id = $3',
+        [reason, 'Cold', leadId]);
 
-    logAudit(runStmt, user.id, leadId, 'lead_flagged_junk', {
-        reason, flagged_by: user.username,
-        assigning_tc: lead.assigned_telecaller
+    await logAudit(user.id, leadId, 'lead_flagged_junk', {
+        reason, flagged_by: user.username, assigning_tc: lead.assigned_telecaller
     });
 
-    // Recalculate score (will apply -50 junk penalty)
-    recalculateAndSave(leadId, queryOne, runStmt, user.id);
+    try { await recalculateAndSave(leadId, user.id); } catch (e) { }
 
     return res.json({ message: 'Lead flagged as Junk. Score penalized by -50.' });
 });
 
-// ─────────────────────────────────────────────────────────────
-// PUT /api/leads/:id/decision-deadline — Set decision deadline
-// ─────────────────────────────────────────────────────────────
-router.put('/:id/decision-deadline', (req, res) => {
+// PUT /api/leads/:id/decision-deadline
+router.put('/:id/decision-deadline', async (req, res) => {
     const leadId = parseInt(req.params.id);
     const { decision_deadline } = req.body;
     const user = req.session.user;
@@ -779,35 +753,28 @@ router.put('/:id/decision-deadline', (req, res) => {
     if (user.role === 'telecaller') {
         return res.status(403).json({ error: 'Only Agents/Managers can set decision deadlines' });
     }
-
     if (!decision_deadline) {
         return res.status(400).json({ error: 'decision_deadline is required (ISO date)' });
     }
 
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    runStmt(
-        'UPDATE leads SET decision_deadline = ? WHERE id = ?',
-        [decision_deadline, leadId]
-    );
+    await runStmt('UPDATE leads SET decision_deadline = $1 WHERE id = $2', [decision_deadline, leadId]);
 
-    logAudit(runStmt, user.id, leadId, 'decision_deadline_set', {
+    await logAudit(user.id, leadId, 'decision_deadline_set', {
         deadline: decision_deadline, set_by: user.username
     });
 
     return res.json({ message: 'Decision deadline set', decision_deadline });
 });
 
-// ─────────────────────────────────────────────────────────────
-// PUT /api/leads/:id/reopen — Admin/Manager re-opens a closed lead
-// ─────────────────────────────────────────────────────────────
-router.put('/:id/reopen', (req, res) => {
+// PUT /api/leads/:id/reopen
+router.put('/:id/reopen', async (req, res) => {
     const leadId = parseInt(req.params.id);
     const { reason } = req.body;
     const user = req.session.user;
 
-    // Only Admin/Manager can re-open
     if (!['admin', 'manager'].includes(user.role)) {
         return res.status(403).json({ error: 'Only Admin/Manager can re-open closed leads' });
     }
@@ -816,7 +783,7 @@ router.put('/:id/reopen', (req, res) => {
         return res.status(400).json({ error: 'A reason is required to re-open a lead' });
     }
 
-    const lead = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const lead = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
     const TERMINAL = ['Booking Confirmed', 'Not Interested'];
@@ -824,20 +791,15 @@ router.put('/:id/reopen', (req, res) => {
         return res.status(400).json({ error: 'Lead is not in a terminal status' });
     }
 
-    // Re-open to 'Contacted' (safe midpoint)
-    runStmt('UPDATE leads SET status = ?, ml_status = NULL WHERE id = ?',
-        ['Contacted', leadId]);
+    await runStmt('UPDATE leads SET status = $1, ml_status = NULL WHERE id = $2', ['Contacted', leadId]);
 
-    logAudit(runStmt, user.id, leadId, 'lead_reopened', {
-        reason: reason.trim(),
-        previous_status: lead.status,
-        reopened_by: user.username
+    await logAudit(user.id, leadId, 'lead_reopened', {
+        reason: reason.trim(), previous_status: lead.status, reopened_by: user.username
     });
 
-    // Recalculate fresh score
-    recalculateAndSave(leadId, queryOne, runStmt, user.id);
+    try { await recalculateAndSave(leadId, user.id); } catch (e) { }
 
-    const updated = queryOne('SELECT * FROM leads WHERE id = ?', [leadId]);
+    const updated = await queryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     return res.json({ message: 'Lead re-opened', lead: updated });
 });
 

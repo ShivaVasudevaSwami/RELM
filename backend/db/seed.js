@@ -2,13 +2,13 @@ const bcrypt = require('bcryptjs');
 const { queryOne, runStmt } = require('./database');
 
 async function seedAdmin() {
-    const userCount = queryOne('SELECT COUNT(*) as count FROM users');
+    const userCount = await queryOne('SELECT COUNT(*) as count FROM users');
 
-    if (!userCount || userCount.count === 0) {
+    if (!userCount || parseInt(userCount.count) === 0) {
         const passwordHash = bcrypt.hashSync('swami@120', 10);
 
-        runStmt(
-            "INSERT INTO users (username, password_hash, role, is_active) VALUES (?, ?, 'admin', 1)",
+        await runStmt(
+            "INSERT INTO users (username, password_hash, role, is_active) VALUES ($1, $2, 'admin', 1)",
             ['shiva', passwordHash]
         );
 

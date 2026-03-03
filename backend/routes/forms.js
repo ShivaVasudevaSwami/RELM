@@ -8,14 +8,14 @@ const { recalculateAndSave } = require('../services/scoringEngine');
 
 const generateToken = () => crypto.randomBytes(24).toString('hex');
 
-// ── Round-Robin: find the telecaller with fewest active leads ──
-const getNextTelecaller = () => {
+// Round-Robin: find the telecaller with fewest active leads
+const getNextTelecaller = async () => {
     try {
-        const telecaller = queryOne(
+        const telecaller = await queryOne(
             `SELECT u.id FROM users u
              LEFT JOIN leads l ON l.assigned_telecaller = u.id
                 AND l.status NOT IN ('Not Interested', 'Booking Confirmed')
-             WHERE u.role = 'Telecaller'
+             WHERE u.role = 'telecaller'
              GROUP BY u.id
              ORDER BY COUNT(l.id) ASC
              LIMIT 1`
@@ -24,7 +24,7 @@ const getNextTelecaller = () => {
     } catch { return null; }
 };
 
-// ── Build extra_details JSON from incoming form fields ──
+// Build extra_details JSON from incoming form fields
 const buildExtraDetails = (propType, bhkConfig) => {
     if (!propType || !bhkConfig) return null;
 
@@ -40,10 +40,10 @@ const buildExtraDetails = (propType, bhkConfig) => {
     return null;
 };
 
-// GET /api/forms — list all connected forms
-router.get('/', isAuthenticated, (req, res) => {
+// GET /api/forms
+router.get('/', isAuthenticated, async (req, res) => {
     try {
-        const forms = queryAll(
+        const forms = await queryAll(
             `SELECT f.*, u.username as added_by_username
              FROM forms_config f
              LEFT JOIN users u ON f.added_by = u.id
@@ -52,7 +52,7 @@ router.get('/', isAuthenticated, (req, res) => {
         const parsed = forms.map(f => ({
             ...f,
             field_mapping: (() => { try { return JSON.parse(f.field_mapping || '{}'); } catch { return {}; } })(),
-            webhook_url: `http://localhost:3001/api/forms/webhook/${f.webhook_token}`
+            webhook_url: `/api/forms/webhook/${f.webhook_token}`
         }));
         return res.json(parsed);
     } catch (err) {
@@ -61,8 +61,8 @@ router.get('/', isAuthenticated, (req, res) => {
     }
 });
 
-// POST /api/forms — add new form connection
-router.post('/', isAuthenticated, isAdminOrManager, (req, res) => {
+// POST /api/forms
+router.post('/', isAuthenticated, isAdminOrManager, async (req, res) => {
     try {
         const { form_name, field_mapping } = req.body;
         if (!form_name || form_name.trim().length < 2)
@@ -85,17 +85,17 @@ router.post('/', isAuthenticated, isAdminOrManager, (req, res) => {
             urgency: 'Timeline to Buy'
         };
 
-        const result = runStmt(
+        const result = await runStmt(
             `INSERT INTO forms_config (form_name, webhook_token, field_mapping, added_by)
-             VALUES (?, ?, ?, ?)`,
+             VALUES ($1, $2, $3, $4)`,
             [form_name.trim(), token, JSON.stringify(mapping), req.session.user.id]
         );
 
-        const newForm = queryOne('SELECT * FROM forms_config WHERE id = ?', [result.lastInsertRowid]);
+        const newForm = await queryOne('SELECT * FROM forms_config WHERE id = $1', [result.lastInsertRowid]);
         return res.json({
             ...newForm,
             field_mapping: mapping,
-            webhook_url: `http://localhost:3001/api/forms/webhook/${token}`
+            webhook_url: `/api/forms/webhook/${token}`
         });
     } catch (err) {
         console.error(err);
@@ -103,10 +103,10 @@ router.post('/', isAuthenticated, isAdminOrManager, (req, res) => {
     }
 });
 
-// DELETE /api/forms/:id — remove form connection
-router.delete('/:id', isAuthenticated, isAdminOrManager, (req, res) => {
+// DELETE /api/forms/:id
+router.delete('/:id', isAuthenticated, isAdminOrManager, async (req, res) => {
     try {
-        runStmt('DELETE FROM forms_config WHERE id = ?', [parseInt(req.params.id)]);
+        await runStmt('DELETE FROM forms_config WHERE id = $1', [parseInt(req.params.id)]);
         return res.json({ message: 'Form connection removed' });
     } catch (err) {
         console.error(err);
@@ -114,14 +114,14 @@ router.delete('/:id', isAuthenticated, isAdminOrManager, (req, res) => {
     }
 });
 
-// PATCH /api/forms/:id/toggle — activate/deactivate
-router.patch('/:id/toggle', isAuthenticated, isAdminOrManager, (req, res) => {
+// PATCH /api/forms/:id/toggle
+router.patch('/:id/toggle', isAuthenticated, isAdminOrManager, async (req, res) => {
     try {
-        const form = queryOne('SELECT * FROM forms_config WHERE id = ?', [parseInt(req.params.id)]);
+        const form = await queryOne('SELECT * FROM forms_config WHERE id = $1', [parseInt(req.params.id)]);
         if (!form) return res.status(404).json({ error: 'Form not found' });
 
         const newStatus = form.is_active === 1 ? 0 : 1;
-        runStmt('UPDATE forms_config SET is_active = ? WHERE id = ?', [newStatus, parseInt(req.params.id)]);
+        await runStmt('UPDATE forms_config SET is_active = $1 WHERE id = $2', [newStatus, parseInt(req.params.id)]);
         return res.json({ is_active: newStatus });
     } catch (err) {
         console.error(err);
@@ -130,11 +130,11 @@ router.patch('/:id/toggle', isAuthenticated, isAdminOrManager, (req, res) => {
 });
 
 // POST /api/forms/webhook/:token — receives Google Form submissions (PUBLIC)
-router.post('/webhook/:token', (req, res) => {
+router.post('/webhook/:token', async (req, res) => {
     try {
         const { token } = req.params;
-        const formConfig = queryOne(
-            'SELECT * FROM forms_config WHERE webhook_token = ? AND is_active = 1',
+        const formConfig = await queryOne(
+            'SELECT * FROM forms_config WHERE webhook_token = $1 AND is_active = 1',
             [token]
         );
         if (!formConfig) return res.status(404).json({ error: 'Invalid or inactive webhook token' });
@@ -168,9 +168,8 @@ router.post('/webhook/:token', (req, res) => {
         if (!phone || !/^[6-9]\d{9}$/.test(phone))
             return res.status(400).json({ error: 'Valid phone number required' });
 
-        // Check duplicate
-        const existing = queryOne(
-            'SELECT id, status FROM leads WHERE phone = ? ORDER BY created_at DESC LIMIT 1',
+        const existing = await queryOne(
+            'SELECT id, status FROM leads WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
             [phone]
         );
         if (existing && existing.status !== 'Not Interested' && existing.status !== 'Booking Confirmed') {
@@ -192,13 +191,10 @@ router.post('/webhook/:token', (req, res) => {
         const validOccupation = VALID_OCCUPATIONS.includes(occupation) ? occupation : null;
         const validPurpose = VALID_PURPOSES.includes(purchasePurpose) ? purchasePurpose : null;
 
-        // Build extra_details from bhk_config
         const extraDetails = buildExtraDetails(validType, bhkConfig);
+        const assignedTelecaller = await getNextTelecaller();
 
-        // Round-Robin telecaller assignment
-        const assignedTelecaller = getNextTelecaller();
-
-        const result = runStmt(
+        const result = await runStmt(
             `INSERT INTO leads (name, phone, email,
              occupation, purchase_purpose,
              preferred_property_type,
@@ -206,7 +202,7 @@ router.post('/webhook/:token', (req, res) => {
              budget_range, funding_source, urgency,
              extra_details, assigned_telecaller,
              status, ml_status, created_by, inquiry_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New Inquiry', 'Cold', NULL, 1)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'New Inquiry', 'Cold', NULL, 1)`,
             [name, phone, email,
                 validOccupation, validPurpose,
                 validType,
@@ -218,8 +214,7 @@ router.post('/webhook/:token', (req, res) => {
                 assignedTelecaller]
         );
 
-        // Trigger initial scoring
-        try { recalculateAndSave(result.lastInsertRowid, queryOne, runStmt, null); } catch (e) { /* non-blocking */ }
+        try { await recalculateAndSave(result.lastInsertRowid, null); } catch (e) { /* non-blocking */ }
 
         return res.json({
             success: true,

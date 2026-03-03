@@ -1,6 +1,6 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
-const { queryOne, runStmt, execSQL, saveDB } = require('../db/database');
+const { getClient, queryOne, saveDB } = require('../db/database');
 const isAuthenticated = require('../middleware/isAuthenticated');
 const { recalculateAndSave, logAudit } = require('../services/scoringEngine');
 
@@ -10,7 +10,6 @@ router.use(isAuthenticated);
 
 // ═══════════════════════════════════════════════════════════════
 // PIPELINE: Forward-only stage order
-// A stage can only auto-transition FORWARD in this list.
 // ═══════════════════════════════════════════════════════════════
 const PIPELINE_ORDER = [
     'New Inquiry', 'Contacted', 'Qualified',
@@ -23,18 +22,10 @@ const SUCCESS_CALL_STATUSES = ['Interested', 'Picked', 'Busy / Call Back'];
 
 // ═══════════════════════════════════════════════════════════════
 // POST /api/interactions/:lead_id
-//
-// Log a call interaction AND auto-progress the pipeline if the
-// call meets the "Contacted" trigger criteria:
-//   1. Lead is currently "New Inquiry"
-//   2. Call status is a success (Interested / Picked / Busy)
-//   3. Notes are meaningful (≥ 30 characters)
-//
-// Uses SQL Transaction for atomic insert + status update.
 // ═══════════════════════════════════════════════════════════════
 router.post('/:lead_id',
     body('call_status').notEmpty().withMessage('Call status is required'),
-    (req, res) => {
+    async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({ error: errors.array()[0].msg });
@@ -45,100 +36,115 @@ router.post('/:lead_id',
         const note_length = feedback_notes ? feedback_notes.length : 0;
         const user = req.session.user;
 
-        const lead = queryOne('SELECT * FROM leads WHERE id = ?', [lead_id]);
-        if (!lead) {
-            return res.status(404).json({ error: 'Lead not found' });
-        }
-
-        // RBAC: Agents can only log calls for their assigned leads
-        if (user.role === 'agent' && lead.created_by !== user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        // ── Determine auto-progression eligibility ──────────
-        const isSuccessCall = SUCCESS_CALL_STATUSES.includes(call_status);
-        const hasMeaningfulNotes = feedback_notes && feedback_notes.length >= 30;
-        const isNewInquiry = lead.status === 'New Inquiry';
-
-        // Forward-only check: ensure we never move backward
-        const currentIdx = PIPELINE_ORDER.indexOf(lead.status);
-        const contactedIdx = PIPELINE_ORDER.indexOf('Contacted');
-        const canAutoProgress = isNewInquiry && isSuccessCall && hasMeaningfulNotes
-            && currentIdx < contactedIdx;
-
-        // Track what happened for the response
-        let autoProgressed = false;
-        let newPipelineStatus = lead.status;
+        // Use a dedicated client for the transaction
+        const client = await getClient();
 
         try {
+            const leadResult = await client.query('SELECT * FROM leads WHERE id = $1', [lead_id]);
+            const lead = leadResult.rows[0];
+            if (!lead) {
+                client.release();
+                return res.status(404).json({ error: 'Lead not found' });
+            }
+
+            // RBAC: Agents can only log calls for their assigned leads
+            if (user.role === 'agent' && lead.created_by !== user.id) {
+                client.release();
+                return res.status(403).json({ error: 'Access denied' });
+            }
+
+            // ── Determine auto-progression eligibility ──────────
+            const isSuccessCall = SUCCESS_CALL_STATUSES.includes(call_status);
+            const hasMeaningfulNotes = feedback_notes && feedback_notes.length >= 30;
+            const isNewInquiry = lead.status === 'New Inquiry';
+            const currentIdx = PIPELINE_ORDER.indexOf(lead.status);
+            const contactedIdx = PIPELINE_ORDER.indexOf('Contacted');
+            const canAutoProgress = isNewInquiry && isSuccessCall && hasMeaningfulNotes
+                && currentIdx < contactedIdx;
+
+            let autoProgressed = false;
+            let newPipelineStatus = lead.status;
+
             // ── ATOMIC TRANSACTION ──────────────────────────
-            execSQL('BEGIN TRANSACTION');
+            await client.query('BEGIN');
 
             // 1. Insert the interaction
-            const result = runStmt(
-                "INSERT INTO interactions (lead_id, interaction_type, call_status, feedback_notes, note_length, next_follow_up) VALUES (?, 'Call', ?, ?, ?, ?)",
+            await client.query(
+                "INSERT INTO interactions (lead_id, interaction_type, call_status, feedback_notes, note_length, next_follow_up) VALUES ($1, 'Call', $2, $3, $4, $5)",
                 [lead_id, call_status, feedback_notes || null, note_length, next_follow_up || null]
             );
 
-            // 2. Update lead columns:
-            // - last_interaction_at (if meaningful notes)
-            // - next_follow_up (if provided)
-            // - last_call_status (always update to latest)
-            let updateCols = ['last_call_status = ?'];
+            // 2. Update lead columns
+            let updateCols = ['last_call_status = $1'];
             let updateVals = [call_status];
+            let paramIdx = 2;
 
             if (hasMeaningfulNotes) {
-                updateCols.push('last_interaction_at = CURRENT_TIMESTAMP');
+                updateCols.push('last_interaction_at = NOW()');
             }
             if (next_follow_up && call_status !== 'Not Interested') {
-                updateCols.push('next_follow_up = ?');
+                updateCols.push(`next_follow_up = $${paramIdx}`);
                 updateVals.push(next_follow_up);
+                paramIdx++;
             }
 
             updateVals.push(lead_id);
-            runStmt(`UPDATE leads SET ${updateCols.join(', ')} WHERE id = ?`, updateVals);
+            await client.query(
+                `UPDATE leads SET ${updateCols.join(', ')} WHERE id = $${paramIdx}`,
+                updateVals
+            );
 
             // 3. AUTO-PROGRESSION: New Inquiry → Contacted
             if (canAutoProgress) {
-                runStmt("UPDATE leads SET status = 'Contacted' WHERE id = ? AND status = 'New Inquiry'", [lead_id]);
+                await client.query(
+                    "UPDATE leads SET status = 'Contacted' WHERE id = $1 AND status = 'New Inquiry'",
+                    [lead_id]
+                );
                 autoProgressed = true;
                 newPipelineStatus = 'Contacted';
 
-                // Audit log: AUTO_STAGE_UPDATE
-                logAudit(runStmt, user.id, lead_id, 'AUTO_STAGE_UPDATE',
-                    `Moved to Contacted via valid Call Log by ${user.name || user.username}. Call: ${call_status}`
+                // Audit log
+                await client.query(
+                    "INSERT INTO audit_logs (user_id, lead_id, action, details) VALUES ($1, $2, $3, $4)",
+                    [user.id, lead_id, 'AUTO_STAGE_UPDATE',
+                    `Moved to Contacted via valid Call Log by ${user.username}. Call: ${call_status}`]
                 );
             }
 
-            // 4. Handle "Not Interested" override (terminal status)
+            // 4. Handle "Not Interested" override
             if (call_status === 'Not Interested') {
-                runStmt('UPDATE leads SET status = ?, ml_status = ? WHERE id = ?',
-                    ['Not Interested', 'Cold', lead_id]);
+                await client.query(
+                    'UPDATE leads SET status = $1, ml_status = $2 WHERE id = $3',
+                    ['Not Interested', 'Cold', lead_id]
+                );
                 newPipelineStatus = 'Not Interested';
-                autoProgressed = false; // Not a "progression"
+                autoProgressed = false;
 
-                logAudit(runStmt, user.id, lead_id, 'status_change',
-                    { from: lead.status, to: 'Not Interested', trigger: 'call_not_interested' }
+                await client.query(
+                    "INSERT INTO audit_logs (user_id, lead_id, action, details) VALUES ($1, $2, $3, $4)",
+                    [user.id, lead_id, 'status_change',
+                    JSON.stringify({ from: lead.status, to: 'Not Interested', trigger: 'call_not_interested' })]
                 );
             }
 
-            // 5. Recalculate score DURING the transaction
+            // 5. Recalculate score (non-fatal)
             let scoreResult = null;
             try {
-                scoreResult = recalculateAndSave(lead_id, queryOne, runStmt, user.id);
+                scoreResult = await recalculateAndSave(lead_id, user.id);
             } catch (scoreErr) {
                 console.warn('[Scoring] Non-fatal scoring error:', scoreErr.message);
-                // Score failure should NOT block the interaction save
             }
 
-            const updatedLead = queryOne('SELECT * FROM leads WHERE id = ?', [lead_id]);
-            const newInteraction = queryOne(
-                'SELECT * FROM interactions WHERE lead_id = ? ORDER BY interaction_date DESC LIMIT 1',
+            // Fetch updated data
+            const updatedLeadResult = await client.query('SELECT * FROM leads WHERE id = $1', [lead_id]);
+            const updatedLead = updatedLeadResult.rows[0];
+            const newInteractionResult = await client.query(
+                'SELECT * FROM interactions WHERE lead_id = $1 ORDER BY interaction_date DESC LIMIT 1',
                 [lead_id]
             );
+            const newInteraction = newInteractionResult.rows[0];
 
-            execSQL('COMMIT');
-            saveDB(); // Flush to disk AFTER commit
+            await client.query('COMMIT');
 
             return res.json({
                 success: true,
@@ -148,7 +154,6 @@ router.post('/:lead_id',
                 breakdown: scoreResult ? scoreResult.breakdown : null,
                 interaction: newInteraction,
                 lead: updatedLead,
-                // ── Auto-progression feedback ──────────────────
                 auto_progressed: autoProgressed,
                 pipeline_status: newPipelineStatus,
                 auto_message: autoProgressed
@@ -157,9 +162,11 @@ router.post('/:lead_id',
             });
 
         } catch (err) {
-            try { execSQL('ROLLBACK'); } catch (_) { /* ignore rollback errors */ }
+            try { await client.query('ROLLBACK'); } catch (_) { }
             console.error('Interaction transaction error:', err);
             return res.status(500).json({ success: false, error: 'Failed to save interaction', details: err.message });
+        } finally {
+            client.release();
         }
     }
 );

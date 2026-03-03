@@ -8,7 +8,7 @@ const { queryAll, queryOne, runStmt } = require('../db/database');
 const isAuthenticated = require('../middleware/isAuthenticated');
 const { recalculateAndSave } = require('../services/scoringEngine');
 
-// Multer config — store uploaded file temporarily
+// Multer config
 const uploadsDir = path.join(__dirname, '../uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
@@ -37,7 +37,6 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const norm = (val) => (val !== undefined && val !== null) ? String(val).trim() : '';
 
-// ── Case-insensitive lookup for property type ──
 const normalizePropertyType = (raw) => {
     if (!raw) return null;
     const lower = raw.toLowerCase().trim();
@@ -45,30 +44,16 @@ const normalizePropertyType = (raw) => {
     return map[lower] || (VALID_PROPERTY_TYPES.includes(raw) ? raw : null);
 };
 
-// ── Build extra_details JSON from BHK_or_Config, Size_or_Floor, Extra_Spec ──
 const buildExtraDetails = (propType, bhkOrConfig, sizeOrFloor, extraSpec) => {
     if (!propType) return null;
-
     if (propType === 'Flat') {
-        return JSON.stringify({
-            bhk_config: bhkOrConfig || '',
-            floor_pref: sizeOrFloor || '',
-            furnishing: extraSpec || ''
-        });
+        return JSON.stringify({ bhk_config: bhkOrConfig || '', floor_pref: sizeOrFloor || '', furnishing: extraSpec || '' });
     }
     if (propType === 'Villa') {
-        return JSON.stringify({
-            configuration: bhkOrConfig || '',
-            private_garden: (extraSpec || '').toLowerCase() === 'yes',
-            parking: parseInt(sizeOrFloor) || 1
-        });
+        return JSON.stringify({ configuration: bhkOrConfig || '', private_garden: (extraSpec || '').toLowerCase() === 'yes', parking: parseInt(sizeOrFloor) || 1 });
     }
     if (propType === 'Plot') {
-        return JSON.stringify({
-            plot_size: sizeOrFloor || '',
-            zoning: bhkOrConfig || '',
-            road_width: extraSpec || ''
-        });
+        return JSON.stringify({ plot_size: sizeOrFloor || '', zoning: bhkOrConfig || '', road_width: extraSpec || '' });
     }
     return null;
 };
@@ -113,13 +98,11 @@ const validateRow = (row, index) => {
     if (purchasePurpose && !VALID_PURPOSES.includes(purchasePurpose))
         warnings.push(`Purchase Purpose "${purchasePurpose}" not recognized — use Self-Use/Investment`);
 
-    // Build extra_details from spec columns
     const extraDetails = buildExtraDetails(propertyType, bhkOrConfig, sizeOrFloor, extraSpec);
 
     return {
         rowIndex: index + 2,
-        name,
-        phone,
+        name, phone,
         email: email && EMAIL_REGEX.test(email) ? email : null,
         preferred_property_type: propertyType || null,
         preferred_state: state || null,
@@ -132,13 +115,12 @@ const validateRow = (row, index) => {
         purchase_purpose: VALID_PURPOSES.includes(purchasePurpose) ? purchasePurpose : null,
         extra_details: extraDetails,
         isValid: errors.length === 0,
-        errors,
-        warnings
+        errors, warnings
     };
 };
 
-// POST /api/import/preview — parse file and return preview rows
-router.post('/preview', isAuthenticated, upload.single('file'), (req, res) => {
+// POST /api/import/preview
+router.post('/preview', isAuthenticated, upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     try {
@@ -147,7 +129,6 @@ router.post('/preview', isAuthenticated, upload.single('file'), (req, res) => {
         const sheet = workbook.Sheets[sheetName];
         const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-        // Clean up temp file
         try { fs.unlinkSync(req.file.path); } catch (e) { /* ignore */ }
 
         if (rows.length === 0) return res.status(400).json({ error: 'File is empty or has no data rows' });
@@ -155,12 +136,11 @@ router.post('/preview', isAuthenticated, upload.single('file'), (req, res) => {
 
         const validated = rows.map((row, i) => validateRow(row, i));
 
-        // Sandbox: detect duplicates & VIPs in DB
         let duplicateCount = 0;
         for (const row of validated) {
             if (!row.phone || !row.isValid) continue;
-            const existing = queryOne(
-                'SELECT id, name, status, is_vip, assigned_agent FROM leads WHERE phone = ? ORDER BY created_at DESC LIMIT 1',
+            const existing = await queryOne(
+                'SELECT id, name, status, is_vip, assigned_agent FROM leads WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
                 [row.phone]
             );
             if (existing) {
@@ -201,8 +181,8 @@ router.post('/preview', isAuthenticated, upload.single('file'), (req, res) => {
     }
 });
 
-// POST /api/import/confirm — insert valid rows into leads table
-router.post('/confirm', isAuthenticated, (req, res) => {
+// POST /api/import/confirm
+router.post('/confirm', isAuthenticated, async (req, res) => {
     try {
         const { rows } = req.body;
         const userId = req.session.user.id;
@@ -217,9 +197,8 @@ router.post('/confirm', isAuthenticated, (req, res) => {
         const results = { imported: 0, skipped: 0, duplicates: 0, details: [] };
 
         for (const row of validRows) {
-            // Check duplicate
-            const existing = queryOne(
-                'SELECT id, status FROM leads WHERE phone = ? ORDER BY created_at DESC LIMIT 1',
+            const existing = await queryOne(
+                'SELECT id, status FROM leads WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
                 [row.phone]
             );
 
@@ -233,13 +212,13 @@ router.post('/confirm', isAuthenticated, (req, res) => {
             }
 
             try {
-                const result = runStmt(
+                const result = await runStmt(
                     `INSERT INTO leads (name, phone, email, preferred_property_type,
                      preferred_state, preferred_city, preferred_area,
                      budget_range, funding_source, urgency,
                      occupation, purchase_purpose, extra_details,
                      status, ml_status, created_by, inquiry_count)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New Inquiry', 'Cold', ?, 1)`,
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'New Inquiry', 'Cold', $14, 1)`,
                     [row.name, row.phone, row.email,
                     row.preferred_property_type, row.preferred_state,
                     row.preferred_city, row.preferred_area,
@@ -248,8 +227,7 @@ router.post('/confirm', isAuthenticated, (req, res) => {
                         userId]
                 );
 
-                // Trigger initial scoring
-                try { recalculateAndSave(result.lastInsertRowid, queryOne, runStmt, null); } catch (e) { /* non-blocking */ }
+                try { await recalculateAndSave(result.lastInsertRowid, null); } catch (e) { /* non-blocking */ }
 
                 results.imported++;
                 results.details.push({
@@ -272,7 +250,7 @@ router.post('/confirm', isAuthenticated, (req, res) => {
     }
 });
 
-// GET /api/import/template — download sample XLSX template with v4.1 fields
+// GET /api/import/template
 router.get('/template', isAuthenticated, (req, res) => {
     const headers = [
         'Full Name', 'Phone Number', 'Email Address',
@@ -304,7 +282,6 @@ router.get('/template', isAuthenticated, (req, res) => {
     ws['!cols'] = headers.map(() => ({ wch: 20 }));
     XLSX.utils.book_append_sheet(wb, ws, 'Leads Template');
 
-    // Add a "Field Guide" sheet
     const guideHeaders = ['Column Name', 'Required', 'Valid Values', 'Notes'];
     const guideRows = [
         ['Full Name', 'Yes', '2–60 characters', 'Letters and spaces only'],
