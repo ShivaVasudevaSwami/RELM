@@ -70,14 +70,29 @@ router.get('/check-phone',
     }
 );
 
+// IST offset helper: converts a JS Date to an IST-adjusted Date
+// On Render (UTC), new Date() gives UTC. We need IST (+5:30)
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000; // 5h 30m in ms
+function toIST(date) {
+    return new Date(date.getTime() + IST_OFFSET_MS);
+}
+function todayIST() {
+    const ist = toIST(new Date());
+    return ist.toISOString().split('T')[0]; // 'YYYY-MM-DD' in IST
+}
+
+// SQLite IST modifier: use instead of 'localtime' so it works on UTC servers
+const IST_MOD = "'+5 hours', '+30 minutes'";
+
 // Helper: fill in periods with zero counts so graph is continuous
 function fillMissingPeriods(rows, granularity, startDate, endDate) {
     if (!rows || rows.length === 0) return [];
     const rowMap = {};
     rows.forEach(r => { rowMap[r.period] = r; });
     const result = [];
-    const current = startDate ? new Date(startDate) : new Date(rows[0].period + (granularity === 'month' ? '-01' : granularity === 'day' ? '' : '-01-01'));
-    const end = new Date(endDate);
+    // Use IST-aware dates for period generation
+    const current = startDate ? toIST(new Date(startDate)) : new Date(rows[0].period + (granularity === 'month' ? '-01' : granularity === 'day' ? '' : '-01-01'));
+    const end = toIST(new Date(endDate));
     let safetyCounter = 0;
     while (current <= end && safetyCounter < 5000) {
         safetyCounter++;
@@ -115,21 +130,17 @@ router.get('/timeline', (req, res) => {
 
         // Special case: day_hour (1D – hourly grouping)
         if (granularity === 'day_hour') {
-            // Use LOCAL date string (not UTC via toISOString which shifts the date for IST)
-            const now = new Date();
-            const localYear = now.getFullYear();
-            const localMonth = String(now.getMonth() + 1).padStart(2, '0');
-            const localDay = String(now.getDate()).padStart(2, '0');
-            const todayStr = `${localYear}-${localMonth}-${localDay}`;
+            // Compute "today" in IST (works on both local dev and Render UTC)
+            const todayStr = todayIST();
 
-            // Use SQLite 'localtime' modifier so hours match the user's timezone
-            const sql = `SELECT strftime('%H', created_at, 'localtime') as hour,
+            // Use explicit IST offset in SQL instead of 'localtime'
+            const sql = `SELECT strftime('%H', created_at, ${IST_MOD}) as hour,
                 COUNT(*) as total,
                 SUM(CASE WHEN ml_status = 'Hot' THEN 1 ELSE 0 END) as hot,
                 SUM(CASE WHEN ml_status = 'Warm' THEN 1 ELSE 0 END) as warm,
                 SUM(CASE WHEN ml_status = 'Cold' THEN 1 ELSE 0 END) as cold,
                 SUM(CASE WHEN status = 'Booking Confirmed' THEN 1 ELSE 0 END) as confirmed
-                FROM leads WHERE date(created_at, 'localtime') = ? ${roleFilter}
+                FROM leads WHERE date(created_at, ${IST_MOD}) = ? ${roleFilter}
                 GROUP BY hour ORDER BY hour ASC`;
             const rows = queryAll(sql, [todayStr, ...roleParams]);
 
@@ -165,9 +176,9 @@ router.get('/timeline', (req, res) => {
 
         let dateFormat;
         switch (granularity) {
-            case 'day': dateFormat = "strftime('%Y-%m-%d', created_at, 'localtime')"; break;
-            case 'year': dateFormat = "strftime('%Y', created_at, 'localtime')"; break;
-            default: dateFormat = "strftime('%Y-%m', created_at, 'localtime')"; break;
+            case 'day': dateFormat = `strftime('%Y-%m-%d', created_at, ${IST_MOD})`; break;
+            case 'year': dateFormat = `strftime('%Y', created_at, ${IST_MOD})`; break;
+            default: dateFormat = `strftime('%Y-%m', created_at, ${IST_MOD})`; break;
         }
 
         let sql = `SELECT ${dateFormat} as period,
@@ -210,16 +221,16 @@ router.get('/by-period', (req, res) => {
         switch (granularity) {
             case 'day_hour': {
                 const [datePart, hourPart] = period.split('T');
-                dateFilter = "date(l.created_at, 'localtime') = ? AND strftime('%H', l.created_at, 'localtime') = ?";
+                dateFilter = `date(l.created_at, ${IST_MOD}) = ? AND strftime('%H', l.created_at, ${IST_MOD}) = ?`;
                 params.push(datePart, String(hourPart || '00').padStart(2, '0'));
                 break;
             }
             case 'day':
-                dateFilter = "date(l.created_at, 'localtime') = ?"; params.push(period); break;
+                dateFilter = `date(l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
             case 'year':
-                dateFilter = "strftime('%Y', l.created_at, 'localtime') = ?"; params.push(period); break;
+                dateFilter = `strftime('%Y', l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
             default:
-                dateFilter = "strftime('%Y-%m', l.created_at, 'localtime') = ?"; params.push(period); break;
+                dateFilter = `strftime('%Y-%m', l.created_at, ${IST_MOD}) = ?`; params.push(period); break;
         }
 
         let roleFilter = '';
