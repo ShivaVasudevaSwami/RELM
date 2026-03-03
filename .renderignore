@@ -1,0 +1,9 @@
+# RE-LM — Render.com Deployment Ignore
+# Prevents unnecessary files from being uploaded
+
+node_modules/
+.env
+*.db
+test-interaction.js
+run-test.js
+error_output.txt

@@ -1,0 +1,22 @@
+# render.yaml — Render.com Infrastructure-as-Code Blueprint
+# This file auto-configures your service when connected to GitHub.
+#
+# How to use:
+#   1. Push project to GitHub
+#   2. Go to https://dashboard.render.com → New → Blueprint
+#   3. Connect your GitHub repo
+#   4. Render reads this file and creates the service automatically
+
+services:
+  - type: web
+    name: relm
+    runtime: node
+    region: singapore   # Closest to India
+    plan: free
+    buildCommand: cd frontend && npm install && npm run build && cd ../backend && npm install
+    startCommand: cd backend && node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true   # Render generates a random secret

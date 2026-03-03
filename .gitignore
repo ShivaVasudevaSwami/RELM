@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# Build output
+frontend/dist/
+
+# Database (SQLite files)
+backend/db/*.db
+
+# Debug/test files
+backend/test-interaction.js
+backend/run-test.js
+backend/error_output.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
