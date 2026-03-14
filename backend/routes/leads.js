@@ -160,6 +160,21 @@ router.get('/timeline', async (req, res) => {
             case '30d': startDate = new Date(now.getTime() - 30 * 86400000); break;
             case '90d': startDate = new Date(now.getTime() - 90 * 86400000); break;
             case '1y': startDate = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); break;
+            case 'all': {
+                // Find the earliest lead's year to generate yearly skeleton
+                const firstLead = await queryOne(
+                    `SELECT MIN(created_at) as first_date FROM leads WHERE 1=1 ${roleFilter}`,
+                    roleParams
+                );
+                if (firstLead?.first_date) {
+                    startDate = new Date(firstLead.first_date);
+                    startDate.setMonth(0, 1); // Jan 1 of that year
+                } else {
+                    // No leads at all — start from last year for a 2-point skeleton
+                    startDate = new Date(now.getFullYear() - 1, 0, 1);
+                }
+                break;
+            }
             default: startDate = null; break;
         }
 
@@ -170,18 +185,16 @@ router.get('/timeline', async (req, res) => {
             default: dateFormat = "to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM')"; break;
         }
 
+        // Build query — roleFilter already applied via ${roleFilter}
         let sql = `SELECT ${dateFormat} as period,
             COUNT(*) as total,
             SUM(CASE WHEN ml_status = 'Hot' THEN 1 ELSE 0 END) as hot,
             SUM(CASE WHEN ml_status = 'Warm' THEN 1 ELSE 0 END) as warm,
             SUM(CASE WHEN ml_status = 'Cold' THEN 1 ELSE 0 END) as cold,
             SUM(CASE WHEN status = 'Booking Confirmed' THEN 1 ELSE 0 END) as confirmed
-            FROM leads WHERE 1=1`;
+            FROM leads WHERE 1=1 ${roleFilter}`;
         const params = [...roleParams];
 
-        if (user.role !== 'admin' && user.role !== 'manager') {
-            sql += ` AND created_by = $${params.indexOf(user.id) + 1}`;
-        }
         if (startDate) {
             params.push(startDate.toISOString());
             sql += ` AND created_at >= $${params.length}`;
