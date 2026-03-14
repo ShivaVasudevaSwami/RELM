@@ -193,13 +193,6 @@ export default function LeadTimelineGraph({ onPeriodSelect, selectedPeriod, onHo
                         <button onClick={fetchTimeline} className="text-xs text-accent mt-2 hover:underline">Retry</button>
                     </div>
                 </div>
-            ) : timelineData.length === 0 ? (
-                <div className="h-52 flex items-center justify-center text-center">
-                    <div>
-                        <p className="text-4xl mb-2">📈</p>
-                        <p className="text-gray-400 text-sm">No data yet. Add leads to see the timeline.</p>
-                    </div>
-                </div>
             ) : (
                 <>
                     {/* Main area chart */}

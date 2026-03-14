@@ -118,15 +118,31 @@ export default function Dashboard() {
         else if (isPeriodSelected && periodLeadsRef.current.length > 0) {
             source = periodLeadsRef.current;
         }
-        // Priority 3: Default → today's leads (local timezone)
+        // Priority 3: Default → filter by selected range
         else {
-            const todayStr = localDateStr(new Date());
-            source = selectedRange === '1D'
-                ? allLeads.filter(l => {
+            const now = new Date();
+            const todayStr = localDateStr(now);
+
+            if (selectedRange === '1D') {
+                source = allLeads.filter(l => {
                     const d = toLocalDate(l.created_at);
                     return d && localDateStr(d) === todayStr;
-                })
-                : allLeads;
+                });
+            } else if (selectedRange === '1W') {
+                const weekAgo = new Date(now.getTime() - 7 * 86400000);
+                source = allLeads.filter(l => {
+                    const d = toLocalDate(l.created_at);
+                    return d && d >= weekAgo;
+                });
+            } else if (selectedRange === '1M') {
+                const monthAgo = new Date(now.getTime() - 30 * 86400000);
+                source = allLeads.filter(l => {
+                    const d = toLocalDate(l.created_at);
+                    return d && d >= monthAgo;
+                });
+            } else {
+                source = allLeads;
+            }
         }
 
         // Apply ML filter on top
@@ -155,11 +171,18 @@ export default function Dashboard() {
     };
 
     // ── Section header text ─────────────────────────────────
+    const rangeLabel = selectedRange === '1W' ? 'Leads this Week'
+        : selectedRange === '1M' ? 'Leads this Month'
+            : selectedRange === '3M' ? 'Leads (3 Months)'
+                : selectedRange === '1Y' ? 'Leads (1 Year)'
+                    : selectedRange === 'All' ? 'All Leads'
+                        : "Today's Leads";
+
     const sectionTitle = hoveredStats?.period
         ? `Leads at ${formatFullPeriod(hoveredStats.period, selectedRange)}`
         : isPeriodSelected
             ? `Leads in ${formatFullPeriod(selectedPeriod, selectedRange)}`
-            : "Today's Leads";
+            : rangeLabel;
 
     return (
         <div className="p-4 sm:p-6 lg:p-8 min-h-screen">
@@ -239,7 +262,7 @@ export default function Dashboard() {
                     <div className="text-center py-16">
                         <p className="text-5xl mb-4">{hoveredStats ? '📊' : isPeriodSelected ? '📅' : '🔍'}</p>
                         <p className="text-gray-500 text-lg mb-1">
-                            {hoveredStats ? 'No leads added during this period' : isPeriodSelected ? 'No leads found for this period' : 'No leads added today'}
+                            {hoveredStats ? 'No leads added during this period' : isPeriodSelected ? 'No leads found for this period' : `No leads in this ${selectedRange === '1W' ? 'week' : selectedRange === '1M' ? 'month' : 'period'}`}
                         </p>
                         {!hoveredStats && !isPeriodSelected && (
                             <button onClick={() => navigate('/leads/add')} className="btn-primary mt-4 inline-block">+ Add Your First Lead</button>

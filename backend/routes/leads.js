@@ -69,13 +69,16 @@ router.get('/check-phone',
 
 // Helper: fill in periods with zero counts so graph is continuous
 function fillMissingPeriods(rows, granularity, startDate, endDate) {
-    if (!rows || rows.length === 0) return [];
+    // Build lookup from DB rows — may be empty, that's fine
     const rowMap = {};
-    rows.forEach(r => { rowMap[r.period] = r; });
+    (rows || []).forEach(r => { rowMap[r.period] = r; });
+
     const result = [];
-    const current = startDate ? new Date(startDate) : new Date(rows[0].period + (granularity === 'month' ? '-01' : granularity === 'day' ? '' : '-01-01'));
+    // Always generate the full skeleton from startDate to endDate
+    const current = startDate ? new Date(startDate) : new Date();
     const end = new Date(endDate);
     let safetyCounter = 0;
+
     while (current <= end && safetyCounter < 5000) {
         safetyCounter++;
         let period;
@@ -95,6 +98,7 @@ function fillMissingPeriods(rows, granularity, startDate, endDate) {
     }
     return result;
 }
+
 
 // GET /api/leads/timeline — lead counts grouped by day/month/year/hour
 // PostgreSQL uses AT TIME ZONE 'Asia/Kolkata' for IST conversion
