@@ -8,9 +8,7 @@ const router = express.Router();
 
 router.use(isAuthenticated);
 
-// ═══════════════════════════════════════════════════════════════
-// PIPELINE: Forward-only stage order
-// ═══════════════════════════════════════════════════════════════
+// Pipeline forward-only stage order
 const PIPELINE_ORDER = [
     'New Inquiry', 'Contacted', 'Qualified',
     'Site Visit Scheduled', 'Site Visited',
@@ -22,6 +20,7 @@ const SUCCESS_CALL_STATUSES = ['Interested', 'Picked', 'Busy / Call Back'];
 
 // ═══════════════════════════════════════════════════════════════
 // POST /api/interactions/:lead_id
+// OPTIMIZED: Fire-and-forget scoring (respond before recalculate)
 // ═══════════════════════════════════════════════════════════════
 router.post('/:lead_id',
     body('call_status').notEmpty().withMessage('Call status is required'),
@@ -36,7 +35,6 @@ router.post('/:lead_id',
         const note_length = feedback_notes ? feedback_notes.length : 0;
         const user = req.session.user;
 
-        // Use a dedicated client for the transaction
         const client = await getClient();
 
         try {
@@ -53,7 +51,7 @@ router.post('/:lead_id',
                 return res.status(403).json({ error: 'Access denied' });
             }
 
-            // ── Determine auto-progression eligibility ──────────
+            // Determine auto-progression eligibility
             const isSuccessCall = SUCCESS_CALL_STATUSES.includes(call_status);
             const hasMeaningfulNotes = feedback_notes && feedback_notes.length >= 30;
             const isNewInquiry = lead.status === 'New Inquiry';
@@ -65,7 +63,7 @@ router.post('/:lead_id',
             let autoProgressed = false;
             let newPipelineStatus = lead.status;
 
-            // ── ATOMIC TRANSACTION ──────────────────────────
+            // ── ATOMIC TRANSACTION (primary task only) ──────────
             await client.query('BEGIN');
 
             // 1. Insert the interaction
@@ -103,7 +101,6 @@ router.post('/:lead_id',
                 autoProgressed = true;
                 newPipelineStatus = 'Contacted';
 
-                // Audit log
                 await client.query(
                     "INSERT INTO audit_logs (user_id, lead_id, action, details) VALUES ($1, $2, $3, $4)",
                     [user.id, lead_id, 'AUTO_STAGE_UPDATE',
@@ -111,10 +108,10 @@ router.post('/:lead_id',
                 );
             }
 
-            // 4. Handle "Not Interested" override
+            // 4. Handle "Not Interested" override (synchronous — must be in transaction)
             if (call_status === 'Not Interested') {
                 await client.query(
-                    'UPDATE leads SET status = $1, ml_status = $2 WHERE id = $3',
+                    'UPDATE leads SET status = $1, ml_status = $2, score = 0 WHERE id = $3',
                     ['Not Interested', 'Cold', lead_id]
                 );
                 newPipelineStatus = 'Not Interested';
@@ -127,46 +124,37 @@ router.post('/:lead_id',
                 );
             }
 
-            // 5. Recalculate score (non-fatal)
-            let scoreResult = null;
-            try {
-                scoreResult = await recalculateAndSave(lead_id, user.id);
-            } catch (scoreErr) {
-                console.warn('[Scoring] Non-fatal scoring error:', scoreErr.message);
-            }
-
-            // Fetch updated data
-            const updatedLeadResult = await client.query('SELECT * FROM leads WHERE id = $1', [lead_id]);
-            const updatedLead = updatedLeadResult.rows[0];
-            const newInteractionResult = await client.query(
-                'SELECT * FROM interactions WHERE lead_id = $1 ORDER BY interaction_date DESC LIMIT 1',
-                [lead_id]
-            );
-            const newInteraction = newInteractionResult.rows[0];
-
+            // COMMIT the primary task
             await client.query('COMMIT');
+            client.release();
 
-            return res.json({
+            // ══ EARLY RESPONSE — send immediately after COMMIT ══
+            res.json({
                 success: true,
                 message: 'Interaction saved',
-                new_status: scoreResult ? scoreResult.status : lead.ml_status,
-                score: scoreResult ? scoreResult.score : null,
-                breakdown: scoreResult ? scoreResult.breakdown : null,
-                interaction: newInteraction,
-                lead: updatedLead,
+                new_status: call_status === 'Not Interested' ? 'Cold' : lead.ml_status,
+                score: call_status === 'Not Interested' ? 0 : lead.score,
                 auto_progressed: autoProgressed,
                 pipeline_status: newPipelineStatus,
+                scoring: call_status === 'Not Interested' ? 'complete' : 'pending',
                 auto_message: autoProgressed
                     ? `Pipeline auto-updated to Stage 2: Contacted`
                     : null
             });
 
+            // ══ FIRE-AND-FORGET: Scoring runs in background ══
+            // Skip scoring for "Not Interested" — already handled synchronously above
+            if (call_status !== 'Not Interested') {
+                recalculateAndSave(lead_id, user.id).catch(err => {
+                    console.error('[Scoring] Background scoring error (non-fatal):', err.message);
+                });
+            }
+
         } catch (err) {
             try { await client.query('ROLLBACK'); } catch (_) { }
+            client.release();
             console.error('Interaction transaction error:', err);
             return res.status(500).json({ success: false, error: 'Failed to save interaction', details: err.message });
-        } finally {
-            client.release();
         }
     }
 );

@@ -581,68 +581,76 @@ const { queryOne: dbQueryOne, runStmt: dbRunStmt } = require('../db/database');
  * @returns {Promise<{ score: number, status: string, breakdown: Object } | null>}
  */
 async function recalculateAndSave(leadId, userId = null) {
-    // 1. Fetch the lead
     const lead = await dbQueryOne('SELECT * FROM leads WHERE id = $1', [leadId]);
     if (!lead) return null;
+    return recalculateAndSaveWithLead(lead, userId);
+}
 
-    // SCORE FREEZE: Terminal statuses are frozen — no recalculation
+/**
+ * Optimized version: accepts a pre-fetched lead object to skip the
+ * initial SELECT query when the caller already has the lead data.
+ */
+async function recalculateAndSaveWithLead(lead, userId = null) {
+    const leadId = lead.id;
+
+    // SCORE FREEZE: Terminal statuses are frozen
     const TERMINAL = ['Booking Confirmed', 'Not Interested'];
     if (TERMINAL.includes(lead.status)) {
         return { score: lead.score || 0, status: lead.ml_status || 'Cold', breakdown: { frozen: true } };
     }
 
-    // 2. Fetch the LATEST call interaction
-    const lastCall = await dbQueryOne(
-        'SELECT call_status, interaction_date, note_length FROM interactions WHERE lead_id = $1 ORDER BY interaction_date DESC LIMIT 1',
-        [leadId]
-    );
+    // Fetch scoring inputs in parallel where possible
+    const [lastCall, lastVisit] = await Promise.all([
+        dbQueryOne(
+            'SELECT call_status, interaction_date, note_length FROM interactions WHERE lead_id = $1 ORDER BY interaction_date DESC LIMIT 1',
+            [leadId]
+        ),
+        dbQueryOne(
+            'SELECT post_visit_status, logged_at FROM site_visits WHERE lead_id = $1 AND post_visit_status IS NOT NULL ORDER BY logged_at DESC LIMIT 1',
+            [leadId]
+        )
+    ]);
 
-    // 3. Fetch the LATEST site visit with feedback
-    const lastVisit = await dbQueryOne(
-        'SELECT post_visit_status, logged_at FROM site_visits WHERE lead_id = $1 AND post_visit_status IS NOT NULL ORDER BY logged_at DESC LIMIT 1',
-        [leadId]
-    );
-
-    // 4. Fetch matched property for BHK/size mirroring
     let matchedProp = null;
     if (lead.matched_property_id) {
         matchedProp = await dbQueryOne('SELECT * FROM properties WHERE id = $1', [lead.matched_property_id]);
     }
 
-    // 5. Fetch negotiation data
-    const activeNegCount = await dbQueryOne(
-        `SELECT COUNT(*) as cnt FROM negotiations WHERE lead_id = $1 AND status = 'Active'`, [leadId]
-    );
-    const totalBookings = await dbQueryOne(
-        `SELECT COUNT(*) as cnt FROM bookings WHERE lead_id = $1`, [leadId]
-    );
-    const highCompNeg = await dbQueryOne(
-        `SELECT n.property_id FROM negotiations n
-         JOIN properties p ON n.property_id = p.id
-         WHERE n.lead_id = $1 AND n.status = 'Active' AND p.negotiation_count >= 3
-         LIMIT 1`, [leadId]
-    );
+    // Fetch negotiation data in parallel
+    const [activeNegCount, totalBookings, highCompNeg, rofrChallenge, expiredRes, visitCount, noShow] = await Promise.all([
+        dbQueryOne(`SELECT COUNT(*) as cnt FROM negotiations WHERE lead_id = $1 AND status = 'Active'`, [leadId]),
+        dbQueryOne(`SELECT COUNT(*) as cnt FROM bookings WHERE lead_id = $1`, [leadId]),
+        dbQueryOne(
+            `SELECT n.property_id FROM negotiations n
+             JOIN properties p ON n.property_id = p.id
+             WHERE n.lead_id = $1 AND n.status = 'Active' AND p.negotiation_count >= 3
+             LIMIT 1`, [leadId]
+        ),
+        dbQueryOne(
+            `SELECT id FROM reservations WHERE lead_id = $1 AND status = 'Active' AND rofr_challenge_by IS NOT NULL LIMIT 1`,
+            [leadId]
+        ),
+        dbQueryOne(
+            `SELECT COUNT(*) as cnt FROM reservations WHERE lead_id = $1 AND tier = 2 AND status = 'Expired'`,
+            [leadId]
+        ),
+        dbQueryOne(`SELECT COUNT(*) as cnt FROM site_visits WHERE lead_id = $1`, [leadId]),
+        dbQueryOne(
+            `SELECT id FROM site_visits WHERE lead_id = $1 AND post_visit_status = 'No Show' LIMIT 1`, [leadId]
+        )
+    ]);
+
     const negotiationData = {
         activeCount: parseInt(activeNegCount?.cnt) || 0,
         totalBookings: parseInt(totalBookings?.cnt) || 0,
         highCompetition: !!highCompNeg,
-        underRofrChallenge: false,
-        expiredReservations: 0
+        underRofrChallenge: !!rofrChallenge,
+        expiredReservations: parseInt(expiredRes?.cnt) || 0,
+        visitCount: parseInt(visitCount?.cnt) || 0,
+        hasNoShow: !!noShow
     };
 
-    // 5b. Reservation data
-    const rofrChallenge = await dbQueryOne(
-        `SELECT id FROM reservations WHERE lead_id = $1 AND status = 'Active' AND rofr_challenge_by IS NOT NULL LIMIT 1`,
-        [leadId]
-    );
-    const expiredRes = await dbQueryOne(
-        `SELECT COUNT(*) as cnt FROM reservations WHERE lead_id = $1 AND tier = 2 AND status = 'Expired'`,
-        [leadId]
-    );
-    negotiationData.underRofrChallenge = !!rofrChallenge;
-    negotiationData.expiredReservations = parseInt(expiredRes?.cnt) || 0;
-
-    // 5c. Predictive Intent
+    // Predictive intent
     const firstVisitScheduled = await dbQueryOne(
         `SELECT MIN(created_at) as first_date FROM audit_logs
          WHERE lead_id = $1 AND action = 'status_change'
@@ -652,14 +660,6 @@ async function recalculateAndSave(leadId, userId = null) {
         const hoursToVisit = (new Date(firstVisitScheduled.first_date).getTime() - new Date(lead.created_at).getTime()) / 3600000;
         negotiationData.velocityBonus = hoursToVisit <= 48;
     }
-
-    const visitCount = await dbQueryOne(`SELECT COUNT(*) as cnt FROM site_visits WHERE lead_id = $1`, [leadId]);
-    negotiationData.visitCount = parseInt(visitCount?.cnt) || 0;
-
-    const noShow = await dbQueryOne(
-        `SELECT id FROM site_visits WHERE lead_id = $1 AND post_visit_status = 'No Show' LIMIT 1`, [leadId]
-    );
-    negotiationData.hasNoShow = !!noShow;
 
     if (lead.decision_deadline) {
         negotiationData.deadlineMissed = new Date(lead.decision_deadline).getTime() < Date.now();
@@ -671,8 +671,7 @@ async function recalculateAndSave(leadId, userId = null) {
             [lead.phone, leadId]
         );
         if (prevLead?.created_at) {
-            const daysSincePrev = daysSince(prevLead.created_at);
-            negotiationData.zombieResurrection = daysSincePrev >= 180;
+            negotiationData.zombieResurrection = daysSince(prevLead.created_at) >= 180;
         }
     }
 
@@ -694,17 +693,17 @@ async function recalculateAndSave(leadId, userId = null) {
     );
     negotiationData.hasLowballOffer = !!lowball;
 
-    // 6. Calculate
+    // Calculate
     const result = calculate(lead, lastCall, lastVisit, matchedProp, negotiationData);
 
-    // 6b. Save score + ml_status
+    // Save score + ml_status
     const lastCallStatus = lastCall ? lastCall.call_status : null;
     await dbRunStmt(
         'UPDATE leads SET ml_status = $1, score = $2, last_call_status = $3 WHERE id = $4',
         [result.status, result.score, lastCallStatus, leadId]
     );
 
-    // 7. Audit log if temperature changed
+    // Audit log if temperature changed
     const oldStatus = lead.ml_status;
     if (oldStatus !== result.status && userId) {
         await dbRunStmt(
@@ -724,13 +723,6 @@ async function recalculateAndSave(leadId, userId = null) {
 
 // ─── AUDIT HELPER ───────────────────────────────────────────
 
-/**
- * Insert an audit log entry.
- * @param {number} userId
- * @param {number} leadId
- * @param {string} action
- * @param {Object} details - JSON-serializable
- */
 async function logAudit(userId, leadId, action, details) {
     await dbRunStmt(
         'INSERT INTO audit_logs (user_id, lead_id, action, details) VALUES ($1, $2, $3, $4)',
@@ -743,6 +735,7 @@ async function logAudit(userId, leadId, action, details) {
 module.exports = {
     calculate,
     recalculateAndSave,
+    recalculateAndSaveWithLead,
     logAudit,
     parseExtra,
     PIPELINE_POINTS,
@@ -752,3 +745,4 @@ module.exports = {
     STAGNATION_DAYS,
     STAGNATION_PENALTY
 };
+

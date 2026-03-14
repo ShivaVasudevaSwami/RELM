@@ -7,7 +7,10 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.SUPABASE_DB_URL,
-  ssl: { rejectUnauthorized: false } // Supabase requires SSL
+  ssl: { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
 });
 
 // ─── SET TIMEZONE ON EVERY NEW CONNECTION ─────────────────────
@@ -84,7 +87,7 @@ async function execSQL(sql) {
  */
 async function getClient() {
   const client = await pool.connect();
-  await client.query("SET TIME ZONE 'Asia/Kolkata'");
+  // Timezone is auto-set by pool.on('connect') for all connections
   return client;
 }
 
